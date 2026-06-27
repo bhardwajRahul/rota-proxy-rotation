@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +29,10 @@ type parsedProxy struct {
 // Supported formats (auth is always optional):
 //
 //	host:port
+//	host:port:user:pass
 //	user:pass@host:port
 //	protocol://host:port
+//	protocol://host:port:user:pass
 //	protocol://user:pass@host:port
 func parseProxyLine(line string) (parsedProxy, bool) {
 	line = strings.TrimSpace(line)
@@ -49,6 +53,35 @@ func parseProxyLine(line string) (parsedProxy, bool) {
 			// Unknown scheme — treat whole thing as address and hope for the best
 		}
 		line = line[idx+3:]
+	}
+
+	// ── 1.5 host:port:user:pass — colon-separated creds ──────────────────
+	// Disambiguated by validating the port: only triggers when the segment
+	// between the first two ':' parses as a 1–65535 integer. Skipped for
+	// inputs containing '@' (handled by step 2) and bracketed IPv6 hosts.
+	if !strings.ContainsRune(line, '@') && !strings.HasPrefix(line, "[") {
+		if i1 := strings.IndexByte(line, ':'); i1 > 0 {
+			rest := line[i1+1:]
+			if i2 := strings.IndexByte(rest, ':'); i2 > 0 {
+				host := line[:i1]
+				portStr := rest[:i2]
+				tail := rest[i2+1:]
+				if port, err := strconv.Atoi(portStr); err == nil && port >= 1 && port <= 65535 && isValidProxyHost(host) {
+					addr := host + ":" + portStr
+					if iu := strings.IndexByte(tail, ':'); iu > 0 {
+						u := tail[:iu]
+						p := tail[iu+1:]
+						return parsedProxy{
+							address:  addr,
+							protocol: proto,
+							username: &u,
+							password: &p,
+						}, true
+					}
+					// No second ':' in tail → not the 4-segment form; fall through.
+				}
+			}
+		}
 	}
 
 	// ── 2. Try url.Parse for user:pass@host:port ─────────────────────────
@@ -83,6 +116,29 @@ func parseProxyLine(line string) (parsedProxy, bool) {
 	}
 
 	return parsedProxy{}, false
+}
+
+// isValidProxyHost reports whether s looks like a usable proxy host:
+// a non-empty IPv4/IPv6 literal or a hostname-shaped token (letters,
+// digits, dots, hyphens — no spaces or URL metacharacters).
+func isValidProxyHost(s string) bool {
+	if s == "" || strings.ContainsAny(s, " \t\r\n/?#@") {
+		return false
+	}
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '.', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ProxyTester is the subset of HealthChecker used by SourceService.
