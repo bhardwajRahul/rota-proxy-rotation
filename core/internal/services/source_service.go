@@ -63,16 +63,17 @@ func parseProxyLine(line string) (parsedProxy, bool) {
 		if i1 := strings.IndexByte(line, ':'); i1 > 0 {
 			rest := line[i1+1:]
 			if i2 := strings.IndexByte(rest, ':'); i2 > 0 {
-				host := line[:i1]
 				portStr := rest[:i2]
-				tail := rest[i2+1:]
+				host := line[:i1]
+
 				if port, err := strconv.Atoi(portStr); err == nil && port >= 1 && port <= 65535 && isValidProxyHost(host) {
-					addr := host + ":" + portStr
+					tail := rest[i2+1:]
 					if iu := strings.IndexByte(tail, ':'); iu > 0 {
 						u := tail[:iu]
 						p := tail[iu+1:]
+
 						return parsedProxy{
-							address:  addr,
+							address:  host + ":" + portStr,
 							protocol: proto,
 							username: &u,
 							password: &p,
@@ -97,11 +98,13 @@ func parseProxyLine(line string) (parsedProxy, bool) {
 				pass = &p
 			}
 		}
+
 		host := parsed.Host
 		// url.Parse puts host:port in Host
 		if !strings.Contains(host, ":") {
 			return parsedProxy{}, false // no port — unusable
 		}
+
 		return parsedProxy{
 			address:  host,
 			protocol: proto,
@@ -125,9 +128,11 @@ func isValidProxyHost(s string) bool {
 	if s == "" || strings.ContainsAny(s, " \t\r\n/?#@") {
 		return false
 	}
+
 	if net.ParseIP(s) != nil {
 		return true
 	}
+
 	for _, r := range s {
 		switch {
 		case r >= 'a' && r <= 'z',
@@ -138,6 +143,7 @@ func isValidProxyHost(s string) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
