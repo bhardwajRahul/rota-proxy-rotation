@@ -1,4 +1,27 @@
 services:
+  # Single entry point: serves the dashboard and proxies /api + /ws to the core.
+  # Access everything at http://localhost (or your SITE_ADDRESS domain).
+  caddy:
+    image: caddy:2-alpine
+    container_name: rota-caddy
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      # ":80" = plain HTTP on localhost. Set to a domain (e.g. rota.example.com)
+      # for automatic HTTPS in production.
+      - SITE_ADDRESS=${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - rota-network
+    depends_on:
+      rota-core:
+        condition: service_healthy
+
   rota-core:
     build:
       context: ./core
@@ -6,11 +29,12 @@ services:
     container_name: rota-core
     restart: unless-stopped
     ports:
+      # The proxy itself is the product — keep it reachable on the host.
+      # The REST API (8001) is internal only; reach it via Caddy at /api.
       - "${PROXY_PORT:-8000}:8000"
-      - "${API_PORT:-8001}:8001"
     environment:
       - PROXY_PORT=${PROXY_PORT:-8000}
-      - API_PORT=${API_PORT:-8001}
+      - API_PORT=8001
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - DB_HOST=${DB_HOST:-timescaledb}
       - DB_PORT=${DB_PORT:-5432}
@@ -19,7 +43,14 @@ services:
       - DB_NAME=${DB_NAME:-rota}
       - DB_SSLMODE=${DB_SSLMODE:-disable}
       - ROTA_ADMIN_USER=${ROTA_ADMIN_USER:-admin}
-      - ROTA_ADMIN_PASSWORD=${ROTA_ADMIN_PASSWORD:-admin}
+      # Leave empty to auto-generate a strong password on first boot (printed in
+      # the core logs). Set it in .env to choose your own.
+      - ROTA_ADMIN_PASSWORD=${ROTA_ADMIN_PASSWORD:-}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-*}
+      # The core sits behind Caddy, so trust its X-Forwarded-For for the login
+      # rate limiter's per-IP tracking. Set to false only if you expose the API
+      # directly without a trusted reverse proxy (AUD-20).
+      - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS:-true}
     networks:
       - rota-network
     healthcheck:
@@ -45,13 +76,16 @@ services:
       context: ./dashboard
       dockerfile: Dockerfile
       args:
-        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8001}
+        # Empty → the dashboard calls the API same-origin through Caddy.
+        # No rebuild needed when your host/domain changes.
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
+        - NEXT_PUBLIC_PROXY_PORT=${PROXY_PORT:-8000}
     container_name: rota-dashboard
     restart: unless-stopped
-    ports:
-      - "${DASHBOARD_PORT:-3000}:3000"
+    # No host port — the dashboard is served through Caddy.
     environment:
-      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8001}
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
+      - NEXT_PUBLIC_PROXY_PORT=${PROXY_PORT:-8000}
     networks:
       - rota-network
     depends_on:
@@ -82,6 +116,10 @@ services:
 
 volumes:
   timescaledb-data:
+    driver: local
+  caddy-data:
+    driver: local
+  caddy-config:
     driver: local
 
 networks:
