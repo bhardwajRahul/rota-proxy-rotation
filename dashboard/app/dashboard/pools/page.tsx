@@ -83,6 +83,9 @@ export default function PoolsPage() {
   const [hcRunning, setHcRunning] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const hcPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Tracks the most recently requested pool so a slower response for an older
+  // selection can't overwrite a newer one.
+  const selectedPoolReqRef = useRef<number | null>(null)
 
   // Dialog
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -190,24 +193,37 @@ export default function PoolsPage() {
     setSelectedPool(pool)
     setHcJob(null)
     setPoolProxiesLoading(true)
+    selectedPoolReqRef.current = pool.id
     try {
       const [proxiesRes, rules] = await Promise.all([
         api.getPoolProxies(pool.id),
         api.getAlertRules(pool.id).catch(() => []),
       ])
+      // Ignore stale responses if a newer pool has since been selected.
+      if (selectedPoolReqRef.current !== pool.id) return
       setPoolProxies(proxiesRes.proxies)
       setAlertRules(rules)
     } catch {
+      if (selectedPoolReqRef.current !== pool.id) return
       toast.error("Failed to load pool proxies")
     } finally {
-      setPoolProxiesLoading(false)
+      if (selectedPoolReqRef.current === pool.id) setPoolProxiesLoading(false)
     }
   }
 
-  const handleExport = (format: "txt" | "csv") => {
+  const handleExport = async (format: "txt" | "csv") => {
     if (!selectedPool) return
-    const url = api.getPoolExportUrl(selectedPool.id, format)
-    window.open(url, "_blank")
+    try {
+      const blob = await api.exportPool(selectedPool.id, format)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `pool-${selectedPool.id}.${format}`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      toast.error("Failed to export pool")
+    }
   }
 
   const openCreateAlertRule = () => {
@@ -940,6 +956,14 @@ export default function PoolsPage() {
                 value={alertForm.webhook_url}
                 onChange={e => setAlertForm({ ...alertForm, webhook_url: e.target.value })}
               />
+              <p className="text-xs text-muted-foreground mt-1">
+                Any URL gets the JSON alert payload. For a <span className="font-medium">Telegram</span> group
+                topic, use the bot <code className="text-[11px]">sendMessage</code> endpoint — the message text
+                is generated automatically:
+              </p>
+              <code className="mt-1 block break-all rounded bg-muted px-1.5 py-1 text-[11px]">
+                https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage?chat_id=&lt;-100…&gt;&amp;message_thread_id=&lt;topic_id&gt;
+              </code>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>

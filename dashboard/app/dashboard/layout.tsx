@@ -14,6 +14,7 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb"
 import { usePathname, useRouter } from "next/navigation"
+import { api } from "@/lib/api"
 
 export default function DashboardLayout({
   children,
@@ -25,17 +26,36 @@ export default function DashboardLayout({
   const [isAuthenticated, setIsAuthenticated] = React.useState(false)
   const [isLoading, setIsLoading] = React.useState(true)
 
-  // Check authentication on mount
+  // Validate the stored token against the backend on mount so a stale/expired
+  // token can't flash protected content before a later 401 bounce.
   React.useEffect(() => {
-    const token = localStorage.getItem("auth_token")
+    let cancelled = false
 
+    const token = localStorage.getItem("auth_token")
     if (!token) {
       router.push("/login")
-    } else {
-      setIsAuthenticated(true)
+      setIsLoading(false)
+      return
     }
 
-    setIsLoading(false)
+    api
+      .getAdminInfo()
+      .then(() => {
+        if (cancelled) return
+        setIsAuthenticated(true)
+      })
+      .catch(() => {
+        if (cancelled) return
+        api.clearToken()
+        router.push("/login")
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
   }, [router])
 
   // Show loading state while checking authentication

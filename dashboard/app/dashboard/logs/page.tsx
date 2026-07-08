@@ -54,6 +54,8 @@ function LogLevelIcon({ level }: { level: LogLevel }) {
       return <XCircle className="h-4 w-4 text-red-500" />
     case "success":
       return <CheckCircle2 className="h-4 w-4 text-green-500" />
+    default:
+      return <Info className="h-4 w-4 text-muted-foreground" />
   }
 }
 
