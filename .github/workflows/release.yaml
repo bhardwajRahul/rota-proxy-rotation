@@ -46,7 +46,11 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          # Use the auto-provided GITHUB_TOKEN (scoped by the job's
+          # `packages: write` permission) instead of a hand-maintained PAT that
+          # expires. Requires the ghcr.io/<owner>/rota package to grant this repo
+          # write access (Package settings → Manage Actions access).
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels)
         id: meta
