@@ -34,7 +34,7 @@ Whether you're conducting web scraping operations, performing security research,
 ## ✨ Key Features
 
 ### Core Proxy Server
-- 🚀 **High Performance**: Handle thousands of concurrent requests with minimal latency
+- 🚀 **High Performance**: Handle thousands of concurrent requests with minimal latency — pooled upstream transports (keep-alive reuse), zero-copy `splice(2)` tunneling on Linux, and batched request telemetry that coalesces per-request DB writes
 - 🔄 **Smart Rotation**: Multiple rotation strategies (random, round-robin, least connections, time-based)
 - 🤖 **Automatic Management**: Real-time proxy pool monitoring with automatic unhealthy proxy removal
 - 🌍 **Multi-Protocol**: Full support for HTTP, HTTPS, SOCKS4, SOCKS4A, and SOCKS5
@@ -81,6 +81,8 @@ Whether you're conducting web scraping operations, performing security research,
 - 🔄 **Change Password**: Update username/password via the Settings UI (requires current password)
 - 🌐 **Public endpoints only**: `GET /health` and `POST /auth/login`
 - 🛡️ **Auth Brute-Force Protection**: Per-IP block after N failed attempts + global lockout when request rate exceeds threshold (all configurable via `.env`)
+- 🧱 **Spoof-Resistant Rate Limiting**: Client IP is only derived from forwarded headers when `TRUST_PROXY_HEADERS` is enabled, so per-IP limits can't be bypassed with a forged `X-Forwarded-For`
+- 🔌 **WebSocket Origin Validation**: Live dashboard/log streams reject cross-origin connections (CSWSH protection), honoring the configured CORS allowlist
 - 🏷️ **Proxy Tags**: Label proxies with custom tags for fine-grained pool filtering
 - 🧹 **Dead Proxy Cleanup**: Configurable automatic removal of long-failed or low-quality proxies
 
@@ -112,73 +114,72 @@ Whether you're conducting web scraping operations, performing security research,
 
 ### Using Docker Compose (Recommended)
 
-The fastest way to get Rota up and running:
+Everything runs behind a single entry point, so there's just one URL to open and
+no API URL to configure.
 
 ```bash
-# 1. Clone the repository
+# 1. Clone and start — no config file needed
 git clone https://github.com/alpkeskin/rota.git
 cd rota
+docker compose up -d          # or: make up
 
-# 2. Create your environment file
-cp .env.example .env
-# For local development the defaults work as-is.
-# For production: set NEXT_PUBLIC_API_URL to your public API URL.
-
-# 3. Start all services
-docker compose up -d
-
-# 4. Check service status
-docker compose ps
+# 2. Grab the auto-generated admin password from the logs
+make password                  # or: docker compose logs rota-core | grep -i password
 ```
 
-**Access the services:**
-- 🌐 **Dashboard**: http://localhost:3000
-- 🔧 **API**: http://localhost:8001
-- 🔄 **Proxy**: http://localhost:8000
-- 🗄️ **Database**: localhost:5432
+Then open **http://localhost** and log in with user `admin` and the password
+from the logs. That's it — the dashboard, API and live logs are all served from
+the same origin, so it works the same whether you're on `localhost` or a remote
+server's IP.
 
-**Default credentials for dashboard:**
-- Username: `admin`
-- Password: `admin`
+**What's exposed:**
+- 🌐 **Web UI + API**: http://localhost (everything — `/`, `/api`, `/docs`)
+- 🔄 **Proxy**: `localhost:8000` (what your clients connect through)
+
+> First-boot credentials are seeded once. Leave `ROTA_ADMIN_PASSWORD` unset to
+> get a strong random password (shown in the logs), or set it in `.env` to pick
+> your own. Change it anytime via **Settings → Admin Account**.
 
 ### Configuration
 
-All settings are controlled through a single `.env` file (see `.env.example` for all options with descriptions):
+No `.env` is required — defaults work out of the box. Copy `cp .env.example .env`
+only to change something. The common knobs:
 
 | Variable | Default | Description |
 |---|---|---|
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8001` | Public URL of the API — used by the browser |
-| `PROXY_PORT` | `8000` | Host port for the proxy server |
-| `API_PORT` | `8001` | Host port for the REST API |
-| `DASHBOARD_PORT` | `3000` | Host port for the web dashboard |
+| `SITE_ADDRESS` | `:80` | Web entry address. Set a domain for automatic HTTPS |
+| `ROTA_ADMIN_PASSWORD` | _(random)_ | Initial admin password; blank → generated & logged |
 | `ROTA_ADMIN_USER` | `admin` | Initial dashboard username (seeded once) |
-| `ROTA_ADMIN_PASSWORD` | `admin` | Initial dashboard password (seeded once, min 6 chars) |
+| `PROXY_PORT` | `8000` | Host port for the proxy your clients connect to |
+| `HTTP_PORT` / `HTTPS_PORT` | `80` / `443` | Web entry ports (Caddy) |
 | `DB_PASSWORD` | `rota_password` | TimescaleDB password |
+| `CORS_ALLOWED_ORIGINS` | `*` | API CORS allowlist (irrelevant behind the proxy) |
+| `TRUST_PROXY_HEADERS` | `true` | Trust `X-Forwarded-For`/`X-Real-IP` for the login rate limiter. Keep `true` behind the bundled Caddy; set `false` if the API is exposed directly |
 | `LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
-| `AUTH_IP_MAX_ATTEMPTS` | `10` | Failed login attempts before an IP is blocked |
-| `AUTH_IP_WINDOW_MINUTES` | `10` | Sliding window (minutes) to count per-IP failures |
-| `AUTH_IP_BLOCK_MINUTES` | `30` | How long a blocked IP cannot attempt login |
-| `AUTH_GLOBAL_MAX_PER_MINUTE` | `1000` | Max total login attempts/min across all IPs before global lockout |
-| `AUTH_GLOBAL_LOCKOUT_MINUTES` | `1` | Duration of global login lockout |
 
-> **Note**: `ROTA_ADMIN_USER` and `ROTA_ADMIN_PASSWORD` are only used when the database is empty (first start). After that, use the **Settings → Admin Account** page to change credentials.
+See `.env.example` for the full list including auth brute-force protection.
 
-### Production Deployment
+> **Note**: `ROTA_ADMIN_USER` / `ROTA_ADMIN_PASSWORD` are only used when the
+> database is empty (first start). Afterwards, use **Settings → Admin Account**.
 
-For production, set at minimum:
+### Production Deployment (HTTPS)
+
+Point a domain at the server and set one variable — Caddy obtains and renews a
+TLS certificate automatically:
 
 ```bash
 # .env
-NEXT_PUBLIC_API_URL=https://api.yourdomain.com
+SITE_ADDRESS=rota.example.com
 DB_PASSWORD=a-strong-random-password
 ROTA_ADMIN_PASSWORD=a-strong-password
 ```
 
-Then rebuild the dashboard (required when changing `NEXT_PUBLIC_API_URL`, as it is baked into the Next.js bundle at build time):
-
 ```bash
 docker compose up -d --build
 ```
+
+Everything is then served over HTTPS at `https://rota.example.com` — no separate
+API host, no dashboard rebuild when the domain changes.
 
 ### Using Docker
 
@@ -202,24 +203,24 @@ docker run -d \
 ### From Source
 
 ```bash
-# Prerequisites: Go 1.25.3+, Node.js 20+, PostgreSQL 16+ with TimescaleDB
+# Prerequisites: Go 1.25.3+, Node.js 20+, pnpm, and TimescaleDB reachable
 
 # Clone the repository
 git clone https://github.com/alpkeskin/rota.git
 cd rota
 
-# Start Core
-cd core
-cp .env .env.local  # Configure your environment
-make install
-make dev
+# Start the Go core (serves API on :8001, proxy on :8000)
+make dev-core            # or: cd core && go run ./cmd/server
 
-# Start Dashboard (in new terminal)
+# In a second terminal, start the dashboard.
+# Dev runs on separate ports, so point the browser at the core directly:
 cd dashboard
-npm install
-cp .env.local .env.local  # Configure API URL
-npm run dev
+cp .env.local.example .env.local     # sets NEXT_PUBLIC_API_URL=http://localhost:8001
+make -C .. dev-dashboard             # or: pnpm install && pnpm dev
 ```
+
+> The DB connection and admin credentials come from the same environment
+> variables as the Docker setup (see `.env.example`).
 
 ### Testing the Proxy
 
@@ -242,48 +243,56 @@ curl https://api.ipify.org?format=json
 
 ### Interactive API Documentation (Swagger)
 
-Rota provides interactive API documentation through Swagger UI. Once the core service is running, you can access it at:
+Rota provides interactive API documentation. Once the stack is running, you can access it at:
 
 ```
-http://localhost:8001/docs
+http://localhost/docs
 ```
 
-The Swagger interface allows you to:
+The docs interface allows you to:
 - 📖 Browse all available API endpoints
 - 🧪 Test API requests directly from your browser
 - 📝 View request/response schemas
 - 🔍 Explore authentication requirements
 
 **Quick Access:**
-- **Swagger UI**: http://localhost:8001/docs
-- **OpenAPI Spec**: http://localhost:8001/docs/swagger.json
+- **API docs**: http://localhost/docs
+- **OpenAPI Spec**: http://localhost/api/v1/swagger.json
 
 ---
 
 ## 🏗️ Architecture
 
-Rota is built as a modern monorepo with three main components:
+Rota is a monorepo. A single reverse proxy (Caddy) is the only web entry point,
+so the browser talks to one origin; the dashboard, API and WebSockets are all
+same-origin behind it. Only the proxy port is exposed separately.
 
 ```
+                         Browser
+                            │  http(s)://localhost  (one origin)
+                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                        Rota Platform                        │
 ├─────────────────────────────────────────────────────────────┤
-│                                                             │
+│                    ┌──────────────┐                         │
+│                    │    Caddy     │  :80 / :443 (auto-HTTPS)│
+│                    │ reverse proxy│                         │
+│                    └──────┬───────┘                         │
+│           /  , /_next     │      /api/* , /ws/* , /docs     │
+│        ┌──────────────────┴───────────────┐                 │
+│        ▼                                   ▼                 │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
-│  │   Dashboard  │───▶│  Core (API)  │───▶│ TimescaleDB  │   │
+│  │   Dashboard  │    │  Core (API)  │───▶│ TimescaleDB  │   │
 │  │   Next.js    │    │     Go       │    │  PostgreSQL  │   │
-│  │  Port 3000   │    │  Port 8001   │    │  Port 5432   │   │
-│  └──────────────┘    └──────────────┘    └──────────────┘   │
-│         │                    │                              │
-│         │                    ▼                              │
-│         │            ┌──────────────┐                       │
-│         └───────────▶│ Proxy Server │                       │
+│  │  (internal)  │    │  (internal)  │    │  (internal)  │   │
+│  └──────────────┘    └──────┬───────┘    └──────────────┘   │
+│                             ▼                               │
+│                      ┌──────────────┐                       │
+│                      │ Proxy Server │  :8000 (exposed)      │
 │                      │      Go      │                       │
-│                      │  Port 8000   │                       │
-│                      └──────────────┘                       │
-│                              │                              │
-└──────────────────────────────┼──────────────────────────────┘
-                               ▼
+│                      └──────┬───────┘                       │
+└─────────────────────────────┼───────────────────────────────┘
+                              ▼
                      ┌──────────────────┐
                      │   Proxy Pool     │
                      │  (External IPs)  │
@@ -354,11 +363,11 @@ Pools also support **ISP filters** (substring match, OR logic) and **tag filters
 ```bash
 # Plain text — one protocol://ip:port per line
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8001/api/v1/pools/{id}/export?format=txt" -o pool.txt
+  "http://localhost/api/v1/pools/{id}/export?format=txt" -o pool.txt
 
 # CSV — with status, geo, ISP, success rate
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8001/api/v1/pools/{id}/export?format=csv" -o pool.csv
+  "http://localhost/api/v1/pools/{id}/export?format=csv" -o pool.csv
 ```
 
 #### Webhook Alerts
@@ -368,7 +377,7 @@ Add an alert rule to a pool to be notified when the active proxy count drops bel
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  "http://localhost:8001/api/v1/pools/{id}/alert-rules" \
+  "http://localhost/api/v1/pools/{id}/alert-rules" \
   -d '{
     "enabled": true,
     "min_active_proxies": 10,
@@ -388,6 +397,37 @@ Payload sent to the webhook:
   "threshold": 10,
   "fired_at": "2026-04-02T04:30:00Z"
 }
+```
+
+##### Telegram alerts (group topics)
+
+Any other URL receives the generic JSON payload above. When the webhook host is
+`api.telegram.org`, Rota instead calls the Telegram Bot API `sendMessage` method
+and **generates the message text for you** — so you don't need a `text=`
+parameter. To alert a topic inside a group:
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy its token.
+2. Add the bot to your group and give it permission to post in the topic.
+3. Find the group's numeric `chat_id` (a negative number, e.g. `-1001234567890`)
+   and the topic's `message_thread_id`.
+4. Set the alert rule's **Webhook URL** to:
+
+```
+https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<-100...>&message_thread_id=<topic_id>
+```
+
+- `message_thread_id` is optional — omit it to post to the group's main channel.
+- The `bot` prefix on the token is required by Telegram; Rota adds it
+  automatically if you leave it out.
+- `webhook_method` is ignored for Telegram (always `POST`).
+
+The delivered message looks like:
+
+```
+🔴 Rota pool alert
+Pool: US Residential (#1)
+Active proxies: 8 / 9
+Threshold: 9
 ```
 
 ### Per-User Routing
@@ -412,12 +452,12 @@ All API endpoints require a JWT bearer token obtained from `POST /api/v1/auth/lo
 
 ```bash
 # Login
-TOKEN=$(curl -s -X POST http://localhost:8001/api/v1/auth/login \
+TOKEN=$(curl -s -X POST http://localhost/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"yourpassword"}' | jq -r '.token')
 
 # Use token
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8001/api/v1/proxies
+curl -H "Authorization: Bearer $TOKEN" http://localhost/api/v1/proxies
 ```
 
 Public endpoints (no token required):
@@ -434,6 +474,12 @@ The login endpoint has two independent rate-limit mechanisms:
 | **Global lockout** | ≥ `AUTH_GLOBAL_MAX_PER_MINUTE` total attempts per minute across all IPs | `429` — login disabled for everyone for `AUTH_GLOBAL_LOCKOUT_MINUTES` minute(s) |
 
 Both responses include a `Retry-After` header. All thresholds are configurable via `.env`.
+
+> **Behind a reverse proxy?** Per-IP tracking uses the socket peer address by
+> default. Set `TRUST_PROXY_HEADERS=true` (the default in the bundled Caddy
+> setup) so the real client IP is read from `X-Forwarded-For` instead of the
+> proxy's address. Leave it `false` when the API is exposed directly, otherwise
+> a client could forge the header to dodge the per-IP block.
 
 The dashboard automatically redirects to the login page with a *"Session expired"* message when a `401` response is received.
 
