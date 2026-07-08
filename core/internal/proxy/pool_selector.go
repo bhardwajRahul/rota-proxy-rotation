@@ -2,9 +2,8 @@ package proxy
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
 	"sync"
 
 	"github.com/alpkeskin/rota/core/internal/database"
@@ -19,10 +18,10 @@ type PoolSelector struct {
 	method string // roundrobin | random | stick
 	stick  int    // stick_count
 
-	mu         sync.Mutex
-	proxies    []*models.Proxy
-	rrIdx      int
-	stickIdx   int
+	mu          sync.Mutex
+	proxies     []*models.Proxy
+	rrIdx       int
+	stickIdx    int
 	stickServed int
 }
 
@@ -99,11 +98,9 @@ func (ps *PoolSelector) Select(_ context.Context) (*models.Proxy, error) {
 
 	switch ps.method {
 	case "random":
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(ps.proxies))))
-		if err != nil {
-			return nil, fmt.Errorf("random selection failed: %w", err)
-		}
-		return ps.proxies[n.Int64()], nil
+		// math/rand/v2: per-goroutine, lock-free; crypto randomness isn't needed
+		// for pool load balancing (matches RandomSelector).
+		return ps.proxies[rand.IntN(len(ps.proxies))], nil
 
 	case "stick":
 		p := ps.proxies[ps.stickIdx]

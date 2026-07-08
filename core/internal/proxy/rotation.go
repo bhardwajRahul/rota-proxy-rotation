@@ -2,9 +2,8 @@ package proxy
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -51,13 +50,10 @@ func (s *RandomSelector) Select(ctx context.Context) (*models.Proxy, error) {
 		return nil, fmt.Errorf("no proxies available")
 	}
 
-	// Thread-safe random number generation
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(s.proxies))))
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate random number: %w", err)
-	}
-
-	return s.proxies[n.Int64()], nil
+	// math/rand/v2 is per-goroutine and lock-free — far cheaper than crypto/rand
+	// in the selection hot path, and cryptographic randomness isn't needed for
+	// load balancing.
+	return s.proxies[rand.IntN(len(s.proxies))], nil
 }
 
 // Refresh reloads the proxy list from database
@@ -128,6 +124,11 @@ func (s *RoundRobinSelector) Refresh(ctx context.Context) error {
 // LeastConnectionsSelector selects the proxy with the lowest usage count
 type LeastConnectionsSelector struct {
 	*BaseSelector
+	// counts holds live in-memory usage per proxy id, incremented at selection.
+	// proxy.Requests is only a stale 30s DB snapshot that never changes in memory,
+	// so selecting on it always returns the same proxy (AUD-12).
+	countsMu sync.Mutex
+	counts   map[int]int64
 }
 
 // NewLeastConnectionsSelector creates a new least connections selector
@@ -138,10 +139,11 @@ func NewLeastConnectionsSelector(repo *repository.ProxyRepository, settings *mod
 			proxies:  make([]*models.Proxy, 0),
 			settings: settings,
 		},
+		counts: make(map[int]int64),
 	}
 }
 
-// Select returns the proxy with the lowest request count
+// Select returns the proxy with the lowest live in-memory usage count
 func (s *LeastConnectionsSelector) Select(ctx context.Context) (*models.Proxy, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -150,14 +152,20 @@ func (s *LeastConnectionsSelector) Select(ctx context.Context) (*models.Proxy, e
 		return nil, fmt.Errorf("no proxies available")
 	}
 
-	// Find proxy with minimum requests
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+
+	// Pick the proxy with the lowest live count so load actually rotates.
 	minProxy := s.proxies[0]
+	minCount := s.counts[minProxy.ID]
 	for _, proxy := range s.proxies[1:] {
-		if proxy.Requests < minProxy.Requests {
+		if c := s.counts[proxy.ID]; c < minCount {
 			minProxy = proxy
+			minCount = c
 		}
 	}
 
+	s.counts[minProxy.ID]++
 	return minProxy, nil
 }
 
@@ -171,6 +179,18 @@ func (s *LeastConnectionsSelector) Refresh(ctx context.Context) error {
 	s.mu.Lock()
 	s.proxies = proxies
 	s.mu.Unlock()
+
+	// Prune counters for proxies that no longer exist so the map can't grow
+	// unbounded; keep surviving proxies' counts to preserve fairness.
+	s.countsMu.Lock()
+	live := make(map[int]int64, len(proxies))
+	for _, p := range proxies {
+		if c, ok := s.counts[p.ID]; ok {
+			live[p.ID] = c
+		}
+	}
+	s.counts = live
+	s.countsMu.Unlock()
 
 	return nil
 }

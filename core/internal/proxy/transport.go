@@ -5,22 +5,44 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/models"
-	"h12.io/socks"
 	proxyDialer "golang.org/x/net/proxy"
+	"h12.io/socks"
 )
 
-// transportCache caches *http.Transport per proxy address+protocol to avoid
-// creating a new transport (and new connection pool) for every request.
+// transportCache caches *http.Transport per proxy to avoid creating a new
+// transport (and new connection pool) for every request.
 var transportCache sync.Map
+
+// transportCacheKey builds the cache key for a proxy. It includes the credentials
+// so two proxies sharing the same host:port but different creds don't collide, and
+// so a credential change produces a different key (AUD-16).
+//
+// It deliberately does NOT include updated_at: that column is bumped on every
+// request (updateProxyStats sets updated_at=NOW()), which would rotate the key on
+// every 30s selector refresh — throwing away warm keep-alive connection pools and
+// leaking orphaned transports into the cache. Credential rotation is instead
+// handled by the explicit ClearTransportCache() wired into proxy Update/Delete.
+func transportCacheKey(p *models.Proxy) string {
+	user := ""
+	if p.Username != nil {
+		user = *p.Username
+	}
+	pass := ""
+	if p.Password != nil {
+		pass = *p.Password
+	}
+	return fmt.Sprintf("%s://%s|%s:%s", p.Protocol, p.Address, user, pass)
+}
 
 // GetOrCreateTransport returns a cached transport for the given proxy,
 // or creates and caches a new one.
 func GetOrCreateTransport(p *models.Proxy) (*http.Transport, error) {
-	key := p.Protocol + "://" + p.Address
+	key := transportCacheKey(p)
 	if t, ok := transportCache.Load(key); ok {
 		return t.(*http.Transport), nil
 	}
@@ -32,6 +54,27 @@ func GetOrCreateTransport(p *models.Proxy) (*http.Transport, error) {
 	return actual.(*http.Transport), nil
 }
 
+// InvalidateTransport removes any cached transport(s) for the given proxy,
+// regardless of credentials/version. Callers should invoke this when a proxy is
+// updated or deleted so the next request rebuilds with fresh settings.
+func InvalidateTransport(p *models.Proxy) {
+	prefix := p.Protocol + "://" + p.Address + "|"
+	transportCache.Range(func(k, _ any) bool {
+		if ks, ok := k.(string); ok && strings.HasPrefix(ks, prefix) {
+			transportCache.Delete(ks)
+		}
+		return true
+	})
+}
+
+// ClearTransportCache drops all cached transports.
+func ClearTransportCache() {
+	transportCache.Range(func(k, _ any) bool {
+		transportCache.Delete(k)
+		return true
+	})
+}
+
 // CreateProxyTransport creates an HTTP transport configured for the given proxy
 // This is shared between proxy handler and health checker
 func CreateProxyTransport(p *models.Proxy) (*http.Transport, error) {
@@ -40,9 +83,9 @@ func CreateProxyTransport(p *models.Proxy) (*http.Transport, error) {
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,  // Skip certificate verification for proxy connections
+			InsecureSkipVerify: true,             // Skip certificate verification for proxy connections
 			MinVersion:         tls.VersionTLS10, // Support older TLS versions for compatibility
-			MaxVersion:         0, // Allow all TLS versions
+			MaxVersion:         0,                // Allow all TLS versions
 			// Don't specify CipherSuites to accept all available ciphers for maximum compatibility
 			// This is acceptable since InsecureSkipVerify is already true
 		},
