@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/database"
@@ -68,21 +69,24 @@ func writeHTTPResponse(w http.ResponseWriter, resp *http.Response) {
 
 // Server represents the proxy server
 type Server struct {
-	router          *proxyRouter
-	server          *http.Server
-	logger          *logger.Logger
-	port            int
-	selector        ProxySelector
-	tracker         *UsageTracker
-	handler         *UpstreamProxyHandler
-	authMiddleware  *AuthMiddleware
-	userAuthMw      *UserAuthMiddleware
-	rateLimitMw     *RateLimitMiddleware
-	proxyRepo       *repository.ProxyRepository
-	settingsRepo    *repository.SettingsRepository
-	refreshTicker   *time.Ticker
-	cleanupTicker   *time.Ticker
-	stopChan        chan struct{}
+	router *proxyRouter
+	server *http.Server
+	logger *logger.Logger
+	port   int
+	// selectorMu guards selector, which is hot-swapped by ReloadSettings while
+	// the refresh ticker goroutine reads it (AUD-9).
+	selectorMu     sync.RWMutex
+	selector       ProxySelector
+	tracker        *UsageTracker
+	handler        *UpstreamProxyHandler
+	authMiddleware *AuthMiddleware
+	userAuthMw     *UserAuthMiddleware
+	rateLimitMw    *RateLimitMiddleware
+	proxyRepo      *repository.ProxyRepository
+	settingsRepo   *repository.SettingsRepository
+	refreshTicker  *time.Ticker
+	cleanupTicker  *time.Ticker
+	stopChan       chan struct{}
 }
 
 // New creates a new proxy server instance
@@ -115,8 +119,10 @@ func New(
 		log.Info("proxy server initialized successfully")
 	}
 
-	// Create usage tracker
+	// Create usage tracker with batched async stat writes (coalesces per-request
+	// INSERT+UPDATE round-trips on the hot path).
 	tracker := NewUsageTracker(proxyRepo)
+	tracker.StartBatchWriter(log)
 
 	// Create upstream proxy handler
 	handler := NewUpstreamProxyHandler(selector, tracker, &settings.Rotation, log)
@@ -167,6 +173,20 @@ func New(
 	return s, nil
 }
 
+// getSelector returns the current proxy selector under the read lock (AUD-9).
+func (s *Server) getSelector() ProxySelector {
+	s.selectorMu.RLock()
+	defer s.selectorMu.RUnlock()
+	return s.selector
+}
+
+// setSelector atomically swaps the proxy selector (AUD-9).
+func (s *Server) setSelector(selector ProxySelector) {
+	s.selectorMu.Lock()
+	defer s.selectorMu.Unlock()
+	s.selector = selector
+}
+
 // startBackgroundTasks starts periodic background tasks
 func (s *Server) startBackgroundTasks() {
 	// Refresh proxy list every 30 seconds
@@ -176,7 +196,7 @@ func (s *Server) startBackgroundTasks() {
 			select {
 			case <-s.refreshTicker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				if err := s.selector.Refresh(ctx); err != nil {
+				if err := s.getSelector().Refresh(ctx); err != nil {
 					s.logger.Error("failed to refresh proxy list", "error", err)
 				} else {
 					s.logger.Debug("proxy list refreshed")
@@ -225,6 +245,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.cleanupTicker != nil {
 		s.cleanupTicker.Stop()
 	}
+	// Flush any buffered usage records before the process exits.
+	if s.tracker != nil {
+		s.tracker.Stop()
+	}
 
 	return s.server.Shutdown(ctx)
 }
@@ -240,8 +264,8 @@ func (s *Server) ReloadSettings(ctx context.Context) error {
 	s.authMiddleware.UpdateSettings(settings.Authentication)
 	s.rateLimitMw.UpdateSettings(settings.RateLimit)
 
-	// Update handler settings
-	s.handler.settings = &settings.Rotation
+	// Update handler settings (guarded swap — AUD-9).
+	s.handler.setSettings(&settings.Rotation)
 
 	// Recreate selector if rotation method changed
 	newSelector, err := NewProxySelector(s.proxyRepo, &settings.Rotation)
@@ -253,8 +277,10 @@ func (s *Server) ReloadSettings(ctx context.Context) error {
 		return fmt.Errorf("failed to refresh new selector: %w", err)
 	}
 
-	s.selector = newSelector
-	s.handler.selector = newSelector
+	// Guarded swaps so request goroutines and the refresh ticker never read a
+	// torn/stale selector (AUD-9).
+	s.setSelector(newSelector)
+	s.handler.setSelector(newSelector)
 
 	s.logger.Info("settings reloaded successfully")
 	return nil

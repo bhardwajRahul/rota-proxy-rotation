@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/models"
@@ -21,7 +22,25 @@ type HealthChecker struct {
 	settingsRepo *repository.SettingsRepository
 	tracker      *UsageTracker
 	logger       *logger.Logger
-	settings     *models.HealthCheckSettings
+	// settingsMu guards settings, which CheckAllProxies rewrites while worker
+	// goroutines / CheckProxy read it — periodic and API-triggered checks can
+	// otherwise race (AUD-8).
+	settingsMu sync.RWMutex
+	settings   *models.HealthCheckSettings
+}
+
+// getSettings returns the cached health-check settings under the read lock.
+func (h *HealthChecker) getSettings() *models.HealthCheckSettings {
+	h.settingsMu.RLock()
+	defer h.settingsMu.RUnlock()
+	return h.settings
+}
+
+// setSettings atomically swaps the cached health-check settings (AUD-8).
+func (h *HealthChecker) setSettings(settings *models.HealthCheckSettings) {
+	h.settingsMu.Lock()
+	defer h.settingsMu.Unlock()
+	h.settings = settings
 }
 
 // NewHealthChecker creates a new health checker
@@ -43,13 +62,15 @@ func NewHealthChecker(
 func (h *HealthChecker) CheckProxy(ctx context.Context, proxy *models.Proxy) (*models.ProxyTestResult, error) {
 	startTime := time.Now()
 
-	// Load settings if not cached
-	if h.settings == nil {
-		settings, err := h.settingsRepo.GetAll(ctx)
+	// Load settings if not cached (guarded — AUD-8).
+	settings := h.getSettings()
+	if settings == nil {
+		all, err := h.settingsRepo.GetAll(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load settings: %w", err)
 		}
-		h.settings = &settings.HealthCheck
+		settings = &all.HealthCheck
+		h.setSettings(settings)
 	}
 
 	result := &models.ProxyTestResult{
@@ -66,14 +87,17 @@ func (h *HealthChecker) CheckProxy(ctx context.Context, proxy *models.Proxy) (*m
 		result.Error = &errMsg
 		return result, nil
 	}
+	// Per-check transports are single-use; close their idle connections when
+	// done so they don't linger ~90s each run (AUD-41).
+	defer transport.CloseIdleConnections()
 
 	// Override TLS config for health checks to be maximally permissive
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}
 	}
 	transport.TLSClientConfig.InsecureSkipVerify = true
-	transport.TLSClientConfig.MinVersion = 0 // Allow all TLS versions including SSLv3
-	transport.TLSClientConfig.MaxVersion = 0 // No maximum version restriction
+	transport.TLSClientConfig.MinVersion = 0     // Allow all TLS versions including SSLv3
+	transport.TLSClientConfig.MaxVersion = 0     // No maximum version restriction
 	transport.TLSClientConfig.CipherSuites = nil // Accept all cipher suites
 	// This callback allows us to accept even unparseable certificates
 	transport.TLSClientConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
@@ -83,11 +107,11 @@ func (h *HealthChecker) CheckProxy(ctx context.Context, proxy *models.Proxy) (*m
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   time.Duration(h.settings.Timeout) * time.Second,
+		Timeout:   time.Duration(settings.Timeout) * time.Second,
 	}
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", h.settings.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", settings.URL, nil)
 	if err != nil {
 		result.Status = "failed"
 		errMsg := fmt.Sprintf("failed to create request: %v", err)
@@ -96,7 +120,7 @@ func (h *HealthChecker) CheckProxy(ctx context.Context, proxy *models.Proxy) (*m
 	}
 
 	// Add custom headers
-	for _, header := range h.settings.Headers {
+	for _, header := range settings.Headers {
 		parts := strings.SplitN(header, ":", 2)
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
@@ -117,7 +141,7 @@ func (h *HealthChecker) CheckProxy(ctx context.Context, proxy *models.Proxy) (*m
 		if strings.Contains(errMsg, "x509:") || strings.Contains(errMsg, "tls:") {
 			errMsg = fmt.Sprintf("TLS/SSL error: %s (Note: Certificate verification is disabled, but proxy may have issues)", err.Error())
 		} else if strings.Contains(errMsg, "timeout") {
-			errMsg = fmt.Sprintf("Connection timeout after %ds", h.settings.Timeout)
+			errMsg = fmt.Sprintf("Connection timeout after %ds", settings.Timeout)
 		} else if strings.Contains(errMsg, "connection refused") {
 			errMsg = "Connection refused - proxy may be offline"
 		}
@@ -136,9 +160,9 @@ func (h *HealthChecker) CheckProxy(ctx context.Context, proxy *models.Proxy) (*m
 	defer resp.Body.Close()
 
 	// Check status code
-	if resp.StatusCode != h.settings.Status {
+	if resp.StatusCode != settings.Status {
 		result.Status = "failed"
-		errMsg := fmt.Sprintf("unexpected status code: got %d, expected %d", resp.StatusCode, h.settings.Status)
+		errMsg := fmt.Sprintf("unexpected status code: got %d, expected %d", resp.StatusCode, settings.Status)
 		result.Error = &errMsg
 
 		// Record health check failure
@@ -167,12 +191,13 @@ func (h *HealthChecker) CheckProxy(ctx context.Context, proxy *models.Proxy) (*m
 
 // CheckAllProxies tests all proxies concurrently
 func (h *HealthChecker) CheckAllProxies(ctx context.Context) ([]models.ProxyTestResult, error) {
-	// Load settings
-	settings, err := h.settingsRepo.GetAll(ctx)
+	// Load settings and cache them under the lock (AUD-8).
+	all, err := h.settingsRepo.GetAll(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load settings: %w", err)
 	}
-	h.settings = &settings.HealthCheck
+	settings := &all.HealthCheck
+	h.setSettings(settings)
 
 	// Get all proxies (including failed ones for re-testing)
 	query := `
@@ -208,10 +233,10 @@ func (h *HealthChecker) CheckAllProxies(ctx context.Context) ([]models.ProxyTest
 		return []models.ProxyTestResult{}, nil
 	}
 
-	h.logger.Info("starting health check", "proxy_count", len(proxies), "workers", h.settings.Workers)
+	h.logger.Info("starting health check", "proxy_count", len(proxies), "workers", settings.Workers)
 
 	// Create worker pool
-	wp := workerpool.New(h.settings.Workers)
+	wp := workerpool.New(settings.Workers)
 	results := make([]models.ProxyTestResult, len(proxies))
 
 	// Submit jobs

@@ -245,3 +245,59 @@ func TestConnectViaProxyStandalone_RoutesHTTP(t *testing.T) {
 	}
 	conn.Close()
 }
+
+// TestConnectViaHTTPStandalone_NoOverRead is a regression test for issue #19:
+// the CONNECT response reader must not consume bytes past the header block.
+// The mock proxy pipelines the "200" reply and the first tunnel bytes (as a
+// real server would send the TLS ServerHello) in a single write; those bytes
+// must reach the caller intact rather than being swallowed with the response.
+func TestConnectViaHTTPStandalone_NoOverRead(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	const tunnelData = "\x16\x03\x03\x00\x2aTLS-SERVER-HELLO-BYTES"
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		reader := bufio.NewReader(conn)
+		reader.ReadString('\n') // consume CONNECT line
+		for {
+			hdr, _ := reader.ReadString('\n')
+			if strings.TrimSpace(hdr) == "" {
+				break
+			}
+		}
+		// Response header terminator immediately followed by tunnel bytes,
+		// in one write — the exact pipelining that used to corrupt the stream.
+		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n" + tunnelData))
+	}()
+
+	proxy := &models.Proxy{
+		Address:  ln.Addr().String(),
+		Protocol: "http",
+	}
+
+	conn, err := connectViaHTTPStandalone(proxy, "example.com:443", 10*time.Second)
+	if err != nil {
+		t.Fatalf("connectViaHTTPStandalone: %v", err)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, len(tunnelData))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := io.ReadFull(conn, buf)
+	if err != nil {
+		t.Fatalf("read tunnel bytes: %v", err)
+	}
+	if string(buf[:n]) != tunnelData {
+		t.Fatalf("tunnel bytes corrupted: got %q, want %q", buf[:n], tunnelData)
+	}
+}
