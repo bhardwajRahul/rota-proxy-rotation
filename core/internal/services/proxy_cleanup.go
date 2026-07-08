@@ -29,13 +29,16 @@ func NewProxyCleanupService(
 		proxyRepo:    proxyRepo,
 		settingsRepo: settingsRepo,
 		log:          log,
-		interval:     time.Hour, // check every hour; actual run interval from settings
+		interval:     24 * time.Hour, // placeholder; real interval loaded from settings in Start
 	}
 }
 
-// Start launches the background cleanup loop.
+// Start launches the background cleanup loop. The run interval is driven by
+// the proxy_cleanup settings row (CleanupIntervalHours) and is re-read after
+// each run so config changes take effect without a restart.
 func (s *ProxyCleanupService) Start(ctx context.Context) {
 	go func() {
+		s.interval = s.intervalFromSettings(ctx)
 		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
 		for {
@@ -44,10 +47,25 @@ func (s *ProxyCleanupService) Start(ctx context.Context) {
 				return
 			case <-ticker.C:
 				s.run(ctx)
+				if next := s.intervalFromSettings(ctx); next != s.interval {
+					s.interval = next
+					ticker.Reset(next)
+					s.log.Info("proxy cleanup interval updated", "hours", int(next/time.Hour))
+				}
 			}
 		}
 	}()
 	s.log.Info("proxy cleanup service started")
+}
+
+// intervalFromSettings returns the configured cleanup interval, guarding against
+// a missing or non-positive CleanupIntervalHours with a 24h default.
+func (s *ProxyCleanupService) intervalFromSettings(ctx context.Context) time.Duration {
+	cfg, err := s.loadSettings(ctx)
+	if err != nil || cfg.CleanupIntervalHours <= 0 {
+		return 24 * time.Hour
+	}
+	return time.Duration(cfg.CleanupIntervalHours) * time.Hour
 }
 
 func (s *ProxyCleanupService) run(ctx context.Context) {

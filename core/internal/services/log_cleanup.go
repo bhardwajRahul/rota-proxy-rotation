@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/database"
@@ -17,7 +18,12 @@ type LogCleanupService struct {
 	settingsRepo *repository.SettingsRepository
 	logger       *logger.Logger
 	stopChan     chan struct{}
-	ticker       *time.Ticker
+
+	// mu guards ticker/interval, which are read by the worker goroutine and
+	// written by Start/Stop/runCleanup/UpdateSettings.
+	mu       sync.Mutex
+	ticker   *time.Ticker
+	interval time.Duration
 }
 
 // NewLogCleanupService creates a new log cleanup service
@@ -51,7 +57,14 @@ func (s *LogCleanupService) Start(ctx context.Context) error {
 
 	// Set initial interval
 	interval := time.Duration(settings.LogRetention.CleanupIntervalHours) * time.Hour
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	s.mu.Lock()
 	s.ticker = time.NewTicker(interval)
+	s.interval = interval
+	tickC := s.ticker.C
+	s.mu.Unlock()
 
 	// Run cleanup immediately on start
 	go func() {
@@ -60,8 +73,10 @@ func (s *LogCleanupService) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Start background worker
-	go s.worker(ctx)
+	// Start background worker. It reads from the ticker channel captured above;
+	// interval changes are applied via Reset (which keeps the same channel),
+	// never by reassigning the ticker out from under this goroutine.
+	go s.worker(ctx, tickC)
 
 	return nil
 }
@@ -70,16 +85,19 @@ func (s *LogCleanupService) Start(ctx context.Context) error {
 func (s *LogCleanupService) Stop() {
 	s.logger.Info("stopping log cleanup service")
 	close(s.stopChan)
+	s.mu.Lock()
 	if s.ticker != nil {
 		s.ticker.Stop()
 	}
+	s.mu.Unlock()
 }
 
-// worker runs the cleanup job periodically
-func (s *LogCleanupService) worker(ctx context.Context) {
+// worker runs the cleanup job periodically. tickC is the ticker channel
+// captured at start; it stays valid across Reset (interval changes) and Stop.
+func (s *LogCleanupService) worker(ctx context.Context, tickC <-chan time.Time) {
 	for {
 		select {
-		case <-s.ticker.C:
+		case <-tickC:
 			if err := s.runCleanup(ctx); err != nil {
 				s.logger.Error("cleanup job failed", "error", err)
 			}
@@ -120,15 +138,19 @@ func (s *LogCleanupService) runCleanup(ctx context.Context) error {
 		// Don't return error, continue with other tasks
 	}
 
-	// Update ticker if interval changed
+	// Update ticker if the configured interval actually changed vs. the one the
+	// ticker is currently running at (stored in s.interval).
 	newInterval := time.Duration(settings.LogRetention.CleanupIntervalHours) * time.Hour
-	if s.ticker != nil {
-		currentInterval := time.Duration(settings.LogRetention.CleanupIntervalHours) * time.Hour
-		if currentInterval != newInterval {
-			s.ticker.Reset(newInterval)
-			s.logger.Info("updated cleanup interval", "hours", settings.LogRetention.CleanupIntervalHours)
-		}
+	if newInterval <= 0 {
+		newInterval = time.Hour
 	}
+	s.mu.Lock()
+	if s.ticker != nil && newInterval != s.interval {
+		s.ticker.Reset(newInterval)
+		s.interval = newInterval
+		s.logger.Info("updated cleanup interval", "hours", settings.LogRetention.CleanupIntervalHours)
+	}
+	s.mu.Unlock()
 
 	s.logger.Info("log cleanup completed",
 		"retention_days", settings.LogRetention.RetentionDays,
@@ -184,18 +206,35 @@ func (s *LogCleanupService) UpdateSettings(ctx context.Context) error {
 
 	if !settings.LogRetention.Enabled {
 		s.logger.Info("log cleanup disabled")
+		s.mu.Lock()
 		if s.ticker != nil {
 			s.ticker.Stop()
 		}
+		s.mu.Unlock()
 		return nil
 	}
 
-	// Restart ticker with new interval
-	if s.ticker != nil {
-		s.ticker.Stop()
-	}
 	interval := time.Duration(settings.LogRetention.CleanupIntervalHours) * time.Hour
-	s.ticker = time.NewTicker(interval)
+	if interval <= 0 {
+		interval = time.Hour
+	}
+
+	s.mu.Lock()
+	if s.ticker != nil {
+		// Reset the existing ticker (keeps the same channel the worker reads)
+		// instead of reassigning it out from under the worker goroutine.
+		s.ticker.Reset(interval)
+		s.interval = interval
+		s.mu.Unlock()
+	} else {
+		// No ticker yet (service was started while disabled): create one and
+		// start a worker bound to its channel.
+		s.ticker = time.NewTicker(interval)
+		s.interval = interval
+		tickC := s.ticker.C
+		s.mu.Unlock()
+		go s.worker(ctx, tickC)
+	}
 
 	// Run cleanup immediately
 	go func() {

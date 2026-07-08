@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/models"
@@ -89,7 +91,7 @@ func (w *AlertWatcher) check(ctx context.Context) {
 		if err := w.fire(ctx, rule, *pool); err != nil {
 			w.log.Error("failed to fire pool alert webhook",
 				"rule_id", rule.ID,
-				"url", rule.WebhookURL,
+				"url", redactWebhookURL(rule.WebhookURL),
 				"error", err,
 			)
 		} else {
@@ -101,8 +103,41 @@ func (w *AlertWatcher) check(ctx context.Context) {
 	}
 }
 
+// redactWebhookURL returns a form of the webhook URL that is safe to log. For
+// Telegram (and any similar /bot<token>/ path), the token segment embeds a
+// secret that the logger's DB hook would otherwise persist — so it is replaced
+// with a placeholder. Query strings (which may carry chat_id etc.) are dropped.
+func redactWebhookURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "[redacted]"
+	}
+	path := u.Path
+	if strings.HasPrefix(path, "/bot") {
+		rest := strings.TrimPrefix(path, "/bot")
+		if i := strings.IndexByte(rest, '/'); i != -1 {
+			path = "/bot<redacted>" + rest[i:]
+		} else {
+			path = "/bot<redacted>"
+		}
+	}
+	return u.Scheme + "://" + u.Host + path
+}
+
 // fire sends the webhook request for a triggered alert rule.
+//
+// Telegram Bot API endpoints are detected by host and translated into a
+// sendMessage call, since Telegram won't accept the generic JSON payload
+// (issue #31). For a group topic, configure the webhook URL as:
+//
+//	https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>&message_thread_id=<TOPIC_ID>
+//
+// Any other host receives the generic PoolAlertPayload JSON as before.
 func (w *AlertWatcher) fire(ctx context.Context, rule models.PoolAlertRule, pool models.ProxyPool) error {
+	if u, err := url.Parse(rule.WebhookURL); err == nil && strings.EqualFold(u.Hostname(), "api.telegram.org") {
+		return w.fireTelegram(ctx, rule, pool, u)
+	}
+
 	payload := models.PoolAlertPayload{
 		Event:         "pool.degraded",
 		PoolID:        pool.ID,
@@ -141,6 +176,70 @@ func (w *AlertWatcher) fire(ctx context.Context, rule models.PoolAlertRule, pool
 	}
 
 	w.log.Info("pool alert webhook fired",
+		"rule_id", rule.ID,
+		"pool_id", pool.ID,
+		"status", resp.StatusCode,
+	)
+	return nil
+}
+
+// fireTelegram sends the alert as a Telegram Bot API sendMessage call.
+// chat_id (required) and optional message_thread_id (for group topics) are read
+// from the configured webhook URL's query string; the bot token stays in the
+// URL path. See fire() for the expected URL format (issue #31).
+func (w *AlertWatcher) fireTelegram(ctx context.Context, rule models.PoolAlertRule, pool models.ProxyPool, u *url.URL) error {
+	q := u.Query()
+	chatID := q.Get("chat_id")
+	if chatID == "" {
+		return fmt.Errorf("telegram webhook missing chat_id query parameter")
+	}
+
+	text := fmt.Sprintf(
+		"🔴 Rota pool alert\nPool: %s (#%d)\nActive proxies: %d / %d\nThreshold: %d",
+		pool.Name, pool.ID, pool.ActiveProxies, pool.TotalProxies, rule.MinActiveProxies,
+	)
+
+	msg := map[string]any{
+		"chat_id": chatID,
+		"text":    text,
+	}
+	if tid := q.Get("message_thread_id"); tid != "" {
+		msg["message_thread_id"] = tid
+	}
+
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal telegram message: %w", err)
+	}
+
+	// Telegram requires the bot token path segment to be prefixed with "bot"
+	// (e.g. /bot<TOKEN>/sendMessage). Users commonly paste the token without it,
+	// which makes the API return 404 — auto-correct it so the alert still works.
+	path := u.Path
+	if !strings.HasPrefix(path, "/bot") {
+		path = "/bot" + strings.TrimPrefix(path, "/")
+	}
+
+	// Send to the bare endpoint (scheme+host+path) — query params carried the
+	// routing info we've now folded into the JSON body.
+	endpoint := u.Scheme + "://" + u.Host + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build telegram request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("telegram returned HTTP %d", resp.StatusCode)
+	}
+
+	w.log.Info("pool alert telegram fired",
 		"rule_id", rule.ID,
 		"pool_id", pool.ID,
 		"status", resp.StatusCode,

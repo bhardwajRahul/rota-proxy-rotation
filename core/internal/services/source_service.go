@@ -162,8 +162,9 @@ type SourceService struct {
 	logger     *logger.Logger
 	client     *http.Client
 
-	mu     sync.Mutex
-	stopCh chan struct{}
+	mu       sync.Mutex
+	fetching bool // guarded by mu: true while a fetchDueSources batch is running
+	stopCh   chan struct{}
 }
 
 // NewSourceService creates a new SourceService.
@@ -225,8 +226,20 @@ func (s *SourceService) FetchNow(ctx context.Context, sourceID int) (*models.Pro
 
 // fetchDueSources finds all sources that are overdue and fetches them.
 func (s *SourceService) fetchDueSources(ctx context.Context) {
+	// Only guard the shared "am I already fetching?" flag with the mutex — never
+	// hold it across the network fetch/import loop below (which can take minutes).
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.fetching {
+		s.mu.Unlock()
+		return
+	}
+	s.fetching = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.fetching = false
+		s.mu.Unlock()
+	}()
 
 	sources, err := s.sourceRepo.GetDueForFetch(ctx)
 	if err != nil {
@@ -408,7 +421,7 @@ func (s *SourceService) EnrichAll(ctx context.Context) (int, error) {
 
 	geos := s.geoSvc.EnrichProxies(ctx, addresses)
 	for addr, geo := range geos {
-		s.proxyRepo.GetDB().Pool.Exec(ctx, `
+		if _, err := s.proxyRepo.GetDB().Pool.Exec(ctx, `
 			UPDATE proxies SET
 				country_code   = $1,
 				country_name   = $2,
@@ -420,7 +433,9 @@ func (s *SourceService) EnrichAll(ctx context.Context) (int, error) {
 				geo_updated_at = NOW()
 			WHERE address = $8
 		`, geo.CountryCode, geo.CountryName, geo.RegionName, geo.CityName,
-			geo.Latitude, geo.Longitude, geo.ISP, addr)
+			geo.Latitude, geo.Longitude, geo.ISP, addr); err != nil {
+			s.logger.Warn("failed to update geo for proxy (EnrichAll)", "address", addr, "error", err)
+		}
 	}
 
 	// Re-sync pools now that geo data has changed
@@ -429,11 +444,22 @@ func (s *SourceService) EnrichAll(ctx context.Context) (int, error) {
 	return len(geos), nil
 }
 
+// Bounds on how much we're willing to read from a single (possibly hostile)
+// proxy source, and how long one line may be.
+const (
+	maxSourceBytes = 32 << 20 // 32 MiB total per source response
+	maxLineBytes   = 1 << 20  // 1 MiB per line (bufio default is 64 KiB)
+)
+
 // parseProxyList parses a proxy list file, one entry per line.
 // Returns a slice of parsedProxy; invalid lines are silently skipped.
+// The reader is bounded with an io.LimitReader so an oversized/hostile source
+// can't blow up memory, and the scanner buffer is raised so a single long line
+// doesn't trip bufio.ErrTooLong and fail the whole fetch.
 func parseProxyList(r io.Reader) ([]parsedProxy, error) {
 	var proxies []parsedProxy
-	scanner := bufio.NewScanner(r)
+	scanner := bufio.NewScanner(io.LimitReader(r, maxSourceBytes))
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 	for scanner.Scan() {
 		if p, ok := parseProxyLine(scanner.Text()); ok {
 			proxies = append(proxies, p)

@@ -23,9 +23,10 @@ type PoolService struct {
 
 	// per-pool rotation state (roundrobin index, stick counters)
 	mu          sync.Mutex
-	rrIndex     map[int]int   // pool_id -> current roundrobin index
-	stickCur    map[int]int   // pool_id -> current proxy index in stick mode
-	stickCount  map[int]int   // pool_id -> requests served on current proxy
+	rrIndex     map[int]int       // pool_id -> current roundrobin index
+	stickCur    map[int]int       // pool_id -> current proxy index in stick mode
+	stickCount  map[int]int       // pool_id -> requests served on current proxy
+	lastCronRun map[int]time.Time // pool_id -> last scheduled health-check run
 }
 
 // NewPoolService creates a new PoolService
@@ -35,12 +36,13 @@ func NewPoolService(
 	log *logger.Logger,
 ) *PoolService {
 	return &PoolService{
-		poolRepo:   poolRepo,
-		proxyRepo:  proxyRepo,
-		logger:     log,
-		rrIndex:    make(map[int]int),
-		stickCur:   make(map[int]int),
-		stickCount: make(map[int]int),
+		poolRepo:    poolRepo,
+		proxyRepo:   proxyRepo,
+		logger:      log,
+		rrIndex:     make(map[int]int),
+		stickCur:    make(map[int]int),
+		stickCount:  make(map[int]int),
+		lastCronRun: make(map[int]time.Time),
 	}
 }
 
@@ -71,7 +73,7 @@ func (ps *PoolService) runScheduledHealthChecks(ctx context.Context) {
 		return
 	}
 	for _, pool := range pools {
-		if isCronDue(pool.HealthCheckCron) {
+		if ps.cronDue(pool.ID, pool.HealthCheckCron) {
 			poolCopy := pool
 			go func(p models.ProxyPool) {
 				if _, err := ps.HealthCheckPool(ctx, p.ID, p.HealthCheckURL, 20); err != nil {
@@ -326,9 +328,12 @@ func (ps *PoolService) checkOneProxyTimeout(ctx context.Context, p *models.Proxy
 
 // updateProxyStatus writes the new status to the DB
 func (ps *PoolService) updateProxyStatus(ctx context.Context, proxyID int, status string) {
-	ps.proxyRepo.GetDB().Pool.Exec(ctx,
+	if _, err := ps.proxyRepo.GetDB().Pool.Exec(ctx,
 		`UPDATE proxies SET status = $1, last_check = NOW(), updated_at = NOW() WHERE id = $2`,
-		status, proxyID)
+		status, proxyID); err != nil {
+		ps.logger.Warn("failed to update proxy status",
+			"proxy_id", proxyID, "status", status, "error", err)
+	}
 }
 
 // HealthCheckPoolWithProgress is like HealthCheckPool but calls progressFn after each proxy finishes.
@@ -406,23 +411,36 @@ func (ps *PoolService) HealthCheckPoolWithProgress(
 	return result, nil
 }
 
-// isCronDue is a simple every-N-minutes checker.
-// Supports "*/N * * * *" (every N minutes) and "@every Nm" style.
-// For more complex cron expressions just returns false.
-func isCronDue(cron string) bool {
+// cronInterval parses a "*/N * * * *" (every N minutes) cron expression into a
+// duration. Any other / unparseable expression falls back to 30 minutes.
+func cronInterval(cron string) time.Duration {
 	cron = strings.TrimSpace(cron)
 	if strings.HasPrefix(cron, "*/") {
 		parts := strings.Fields(cron)
 		if len(parts) == 5 {
 			var n int
-			fmt.Sscanf(parts[0][2:], "%d", &n)
-			if n <= 0 {
-				n = 30
+			if _, err := fmt.Sscanf(parts[0][2:], "%d", &n); err == nil && n > 0 {
+				return time.Duration(n) * time.Minute
 			}
-			now := time.Now()
-			return now.Minute()%n == 0 && now.Second() < 60
 		}
 	}
 	// Default: every 30 minutes
-	return time.Now().Minute()%30 == 0
+	return 30 * time.Minute
+}
+
+// cronDue reports whether the pool's health-check cron is due to fire, based on
+// how long it's been since it last ran. When it returns true it records "now"
+// as the pool's last-run time, so a due pool fires at most once per interval
+// (instead of repeatedly within the same minute or firing on every tick).
+func (ps *PoolService) cronDue(poolID int, cron string) bool {
+	interval := cronInterval(cron)
+	now := time.Now()
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if last, ok := ps.lastCronRun[poolID]; ok && now.Sub(last) < interval {
+		return false
+	}
+	ps.lastCronRun[poolID] = now
+	return true
 }
