@@ -130,12 +130,21 @@ func (h *LogsHandler) Export(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Get all logs matching filters
-	logs, _, err := h.logRepo.List(r.Context(), 1, 100000, level, "", source, startTime, endTime)
+	// Get all logs matching filters (capped to bound memory/response size)
+	const exportCap = 100000
+	logs, total, err := h.logRepo.List(r.Context(), 1, exportCap, level, "", source, startTime, endTime)
 	if err != nil {
 		h.logger.Error("failed to get logs for export", "error", err)
 		h.errorResponse(w, http.StatusInternalServerError, "Failed to export logs")
 		return
+	}
+
+	// Signal silent truncation so clients know the export is incomplete.
+	if total > exportCap {
+		h.logger.Warn("log export truncated", "returned", len(logs), "total", total, "cap", exportCap)
+		w.Header().Set("X-Export-Truncated", "true")
+		w.Header().Set("X-Export-Total", strconv.Itoa(total))
+		w.Header().Set("X-Export-Returned", strconv.Itoa(len(logs)))
 	}
 
 	switch format {

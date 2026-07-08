@@ -11,7 +11,12 @@ import (
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/models"
 	"github.com/alpkeskin/rota/core/pkg/logger"
+	"h12.io/socks"
 )
+
+// chainFailureThreshold is the number of consecutive failures a proxy must
+// accumulate within a chain before it is evicted from its pool (AUD-11).
+const chainFailureThreshold = 3
 
 // PoolChain holds an ordered list of pool selectors for a user:
 // index 0 = main pool, index 1..N = fallback pools.
@@ -21,6 +26,11 @@ type PoolChain struct {
 	selectors []*PoolSelector
 	logger    *logger.Logger
 	maxRetry  int // total upstream attempts across all pools
+
+	// failCounts tracks consecutive failures per proxy id so a single transient
+	// error doesn't evict an otherwise-healthy proxy (AUD-11).
+	mu         sync.Mutex
+	failCounts map[int]int
 }
 
 // NewPoolChain builds a PoolChain from an ordered list of ProxyPool objects.
@@ -30,9 +40,10 @@ func NewPoolChain(db *database.DB, pools []models.ProxyPool, maxRetry int, log *
 		selectors = append(selectors, NewPoolSelector(db, p))
 	}
 	return &PoolChain{
-		selectors: selectors,
-		logger:    log,
-		maxRetry:  maxRetry,
+		selectors:  selectors,
+		logger:     log,
+		maxRetry:   maxRetry,
+		failCounts: make(map[int]int),
 	}
 }
 
@@ -73,12 +84,31 @@ func (c *PoolChain) pickProxy(ctx context.Context, tried map[int]bool) (*models.
 	return nil, -1, fmt.Errorf("no untried proxies available across all pools")
 }
 
-// markFailed removes the proxy from its pool's in-memory list so it won't be
-// re-selected in this chain's lifecycle (until next Refresh).
+// markFailed records a failure for the proxy and only removes it from its pool's
+// in-memory list after chainFailureThreshold consecutive failures, so transient
+// timeouts don't immediately evict a healthy proxy (AUD-11).
 func (c *PoolChain) markFailed(selIdx int, proxyID int) {
+	c.mu.Lock()
+	c.failCounts[proxyID]++
+	count := c.failCounts[proxyID]
+	if count >= chainFailureThreshold {
+		delete(c.failCounts, proxyID)
+	}
+	c.mu.Unlock()
+
+	if count < chainFailureThreshold {
+		return
+	}
 	if selIdx >= 0 && selIdx < len(c.selectors) {
 		c.selectors[selIdx].RemoveProxy(proxyID)
 	}
+}
+
+// markSucceeded resets the consecutive-failure counter for a proxy.
+func (c *PoolChain) markSucceeded(proxyID int) {
+	c.mu.Lock()
+	delete(c.failCounts, proxyID)
+	c.mu.Unlock()
 }
 
 // SendWithRetry attempts to forward an HTTP request through the chain.
@@ -113,8 +143,9 @@ func (c *PoolChain) SendWithRetry(
 
 		transport, err := CreateProxyTransport(selectedProxy)
 		if err != nil {
+			// Transport-build failure is a local/config error, not a proxy fault —
+			// do not count it toward eviction (AUD-11).
 			lastErr = err
-			c.markFailed(selIdx, selectedProxy.ID)
 			continue
 		}
 
@@ -142,12 +173,18 @@ func (c *PoolChain) SendWithRetry(
 
 		resp, err := client.Do(cloned)
 		if err != nil {
+			// On a redirect-limit (or similar) error client.Do can return a non-nil
+			// response whose body must still be closed to avoid leaking it (AUD-28).
+			if resp != nil {
+				resp.Body.Close()
+			}
 			lastErr = fmt.Errorf("proxy %s attempt %d: %w", selectedProxy.Address, attempt+1, err)
 			log.Warn("pool chain: proxy failed", "proxy", selectedProxy.Address, "err", err)
 			c.markFailed(selIdx, selectedProxy.ID)
 			continue
 		}
 
+		c.markSucceeded(selectedProxy.ID)
 		log.Info("pool chain: success",
 			"proxy", selectedProxy.Address,
 			"status", resp.StatusCode,
@@ -194,6 +231,7 @@ func (c *PoolChain) ConnectWithRetry(
 			continue
 		}
 
+		c.markSucceeded(selectedProxy.ID)
 		log.Info("pool chain CONNECT: success", "proxy", selectedProxy.Address, "host", host)
 		return conn, selectedProxy.ID, nil
 	}
@@ -215,10 +253,26 @@ func connectViaProxyStandalone(p *models.Proxy, host string, settings *models.Ro
 	case "socks5":
 		return connectViaSocks5(p, host)
 	case "socks4", "socks4a":
-		return connectViaSocks5(p, host) // h12.io/socks handles socks4 too; close enough
+		return connectViaSocks4Standalone(p, host)
 	case "http", "https":
 		return connectViaHTTPStandalone(p, host, timeout)
 	default:
 		return nil, fmt.Errorf("unsupported protocol for CONNECT: %s", p.Protocol)
 	}
+}
+
+// connectViaSocks4Standalone dials host through a SOCKS4/SOCKS4A proxy using the
+// h12.io/socks package (the same dialer the HTTP transport path uses). Routing
+// socks4 through the x/net SOCKS5 dialer speaks the wrong protocol (AUD-2).
+func connectViaSocks4Standalone(p *models.Proxy, host string) (net.Conn, error) {
+	// URI format understood by socks.Dial: socks4://[user@]host:port
+	proxyURL := p.Protocol + "://" + p.Address
+	if p.Username != nil && *p.Username != "" {
+		proxyURL = fmt.Sprintf("%s://%s@%s", p.Protocol, *p.Username, p.Address)
+	}
+	conn, err := socks.Dial(proxyURL)("tcp", host)
+	if err != nil {
+		return nil, fmt.Errorf("socks4 dial %s via %s: %w", host, p.Address, err)
+	}
+	return conn, nil
 }

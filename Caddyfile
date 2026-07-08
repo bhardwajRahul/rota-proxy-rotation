@@ -1,0 +1,22 @@
+# Rota — single entry point.
+#
+# One address serves the dashboard and proxies the API + WebSockets to the core
+# on the internal Docker network. Because the browser only ever talks to this
+# origin, there is no build-time API URL and no CORS to configure.
+#
+# Local (default):   SITE_ADDRESS=:80   → http://localhost
+# Production (HTTPS): SITE_ADDRESS=rota.example.com → Caddy gets a cert automatically
+{$SITE_ADDRESS::80} {
+	# API, WebSockets, Swagger docs and health → core
+	@core path /api/* /ws/* /docs /docs/* /health
+	handle @core {
+		reverse_proxy rota-core:8001
+	}
+
+	# Everything else (pages, assets) → the Next.js dashboard
+	handle {
+		reverse_proxy rota-dashboard:3000
+	}
+
+	encode gzip
+}

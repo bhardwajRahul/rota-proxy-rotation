@@ -3,7 +3,10 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,42 +15,72 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow all origins for development
-		// In production, implement proper origin checking
-		return true
-	},
-}
-
 // WebSocketHandler handles WebSocket connections
 type WebSocketHandler struct {
-	dashboardRepo *repository.DashboardRepository
-	proxyRepo     *repository.ProxyRepository
-	logRepo       *repository.LogRepository
-	logger        *logger.Logger
+	dashboardRepo  *repository.DashboardRepository
+	proxyRepo      *repository.ProxyRepository
+	logRepo        *repository.LogRepository
+	logger         *logger.Logger
+	allowedOrigins []string
+	upgrader       websocket.Upgrader
 }
 
-// NewWebSocketHandler creates a new WebSocketHandler
+// NewWebSocketHandler creates a new WebSocketHandler. allowedOrigins is the
+// configured CORS allowlist consulted by the CSWSH origin check.
 func NewWebSocketHandler(
 	dashboardRepo *repository.DashboardRepository,
 	proxyRepo *repository.ProxyRepository,
 	logRepo *repository.LogRepository,
 	log *logger.Logger,
+	allowedOrigins []string,
 ) *WebSocketHandler {
-	return &WebSocketHandler{
-		dashboardRepo: dashboardRepo,
-		proxyRepo:     proxyRepo,
-		logRepo:       logRepo,
-		logger:        log,
+	h := &WebSocketHandler{
+		dashboardRepo:  dashboardRepo,
+		proxyRepo:      proxyRepo,
+		logRepo:        logRepo,
+		logger:         log,
+		allowedOrigins: allowedOrigins,
 	}
+	h.upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     h.checkOrigin,
+	}
+	return h
+}
+
+// checkOrigin guards against Cross-Site WebSocket Hijacking (CSWSH). It permits:
+//   - requests with no Origin header (non-browser clients such as CLI tools),
+//   - same-origin requests (Origin host == request Host),
+//   - requests whose Origin is in the configured CORS allowlist (or "*").
+//
+// Cross-origin browser requests outside the allowlist are rejected.
+func (h *WebSocketHandler) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// No Origin header — not a browser cross-site request; allow.
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	// Same-origin: the Origin host (with port, if any) must equal the Host.
+	if strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+	// Configured allowlist.
+	for _, allowed := range h.allowedOrigins {
+		if allowed == "*" || strings.EqualFold(allowed, origin) {
+			return true
+		}
+	}
+	return false
 }
 
 // DashboardWebSocket handles dashboard real-time updates
 func (h *WebSocketHandler) DashboardWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.logger.Error("failed to upgrade websocket connection", "error", err)
 		return
@@ -59,6 +92,34 @@ func (h *WebSocketHandler) DashboardWebSocket(w http.ResponseWriter, r *http.Req
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
+	// Read client messages in a dedicated goroutine so the periodic ticker
+	// writes below are never blocked by a read. Idle clients send no keep-alive
+	// traffic, so a read timeout is EXPECTED and must not tear down the
+	// connection — only real close/errors cancel the context (issue: idle
+	// dashboard clients disconnected every ~10s).
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			if _, _, err := conn.ReadMessage(); err != nil {
+				// Idle read timeout — keep waiting, this is not an error.
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					h.logger.Warn("dashboard websocket unexpected close", "error", err)
+				}
+				cancel()
+				return
+			}
+		}
+	}()
+
 	// Send updates every 5 seconds
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -69,7 +130,7 @@ func (h *WebSocketHandler) DashboardWebSocket(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Handle incoming messages and send periodic updates
+	// Send periodic updates until the client disconnects or context is cancelled.
 	for {
 		select {
 		case <-ticker.C:
@@ -80,16 +141,6 @@ func (h *WebSocketHandler) DashboardWebSocket(w http.ResponseWriter, r *http.Req
 
 		case <-ctx.Done():
 			h.logger.Info("dashboard websocket context cancelled")
-			return
-		}
-
-		// Check for client messages (for keep-alive or commands)
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				h.logger.Warn("dashboard websocket unexpected close", "error", err)
-			}
 			return
 		}
 	}
@@ -113,7 +164,7 @@ func (h *WebSocketHandler) sendDashboardUpdate(ctx context.Context, conn *websoc
 
 // LogsWebSocket handles real-time log streaming
 func (h *WebSocketHandler) LogsWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.logger.Error("failed to upgrade websocket connection", "error", err)
 		return

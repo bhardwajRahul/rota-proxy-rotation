@@ -11,14 +11,17 @@ export default function MetricsPage() {
   const [isLoading, setIsLoading] = React.useState(true)
 
   React.useEffect(() => {
+    let ignore = false
+
     const fetchMetrics = async () => {
       try {
         const data = await api.getSystemMetrics()
+        if (ignore) return
         setMetrics(data)
       } catch (error) {
         console.error("Failed to fetch system metrics:", error)
       } finally {
-        setIsLoading(false)
+        if (!ignore) setIsLoading(false)
       }
     }
 
@@ -27,7 +30,10 @@ export default function MetricsPage() {
     // Refresh metrics every 5 seconds
     const interval = setInterval(fetchMetrics, 5000)
 
-    return () => clearInterval(interval)
+    return () => {
+      ignore = true
+      clearInterval(interval)
+    }
   }, [])
 
   if (isLoading || !metrics) {

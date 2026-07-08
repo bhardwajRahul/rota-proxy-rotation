@@ -43,7 +43,7 @@ export default function DashboardPage() {
   const [isLoading, setIsLoading] = React.useState(true)
 
   React.useEffect(() => {
-    let ws: WebSocket | null = null
+    let ws: { close: () => void } | null = null
 
     const fetchData = async () => {
       try {
@@ -120,7 +120,7 @@ export default function DashboardPage() {
           <CardContent>
             <div className="text-2xl font-bold">{stats.active_proxies}/{stats.total_proxies}</div>
             <p className="text-xs text-muted-foreground">
-              {Math.round((stats.active_proxies / stats.total_proxies) * 100)}% operational
+              {stats.total_proxies > 0 ? Math.round((stats.active_proxies / stats.total_proxies) * 100) : 0}% operational
             </p>
           </CardContent>
         </Card>

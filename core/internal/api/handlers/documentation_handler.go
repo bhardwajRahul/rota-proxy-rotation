@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	scalar "github.com/MarceloPetrucio/go-scalar-api-reference"
+	"github.com/alpkeskin/rota/core/docs"
 )
 
 // DocumentationHandler handles API documentation endpoints
@@ -15,18 +16,13 @@ func NewDocumentationHandler() *DocumentationHandler {
 	return &DocumentationHandler{}
 }
 
-// ServeDocumentation serves the API documentation using Scalar
+// ServeDocumentation serves the API documentation using Scalar.
+// The spec is passed as embedded content (not a URL) so Scalar never fetches it
+// server-side — that fetch used the external request host and failed behind the
+// reverse proxy, where the core can't reach its own public address (#20).
 func (h *DocumentationHandler) ServeDocumentation(w http.ResponseWriter, r *http.Request) {
-	// Construct the full URL for swagger.json
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	host := r.Host
-	swaggerURL := fmt.Sprintf("%s://%s/api/v1/swagger.json", scheme, host)
-
 	htmlContent, err := scalar.ApiReferenceHTML(&scalar.Options{
-		SpecURL: swaggerURL,
+		SpecContent: string(docs.SwaggerJSON),
 		CustomOptions: scalar.CustomOptions{
 			PageTitle: "Rota Proxy API Documentation",
 		},

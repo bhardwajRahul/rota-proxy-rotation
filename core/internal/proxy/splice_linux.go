@@ -113,7 +113,14 @@ func pollFD(fd int, write bool) error {
 	}
 	fds := []unix.PollFd{{Fd: int32(fd), Events: events}}
 	for {
-		n, err := unix.Poll(fds, 60000) // 60s timeout
+		// AUD-30: use a finite poll timeout but renew it on expiry instead of
+		// returning ETIMEDOUT. A fixed 60s idle kill tears down idle-but-healthy
+		// CONNECT tunnels (websockets, long-poll); the io.Copy fallback imposes
+		// no such limit, so we match it — we only return on a real error/hangup.
+		// POLLERR/POLLHUP/POLLNVAL are reported regardless of Events, so a
+		// closed/errored fd still wakes the poll and lets the caller's next
+		// splice observe the error and exit.
+		n, err := unix.Poll(fds, 60000)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -121,7 +128,9 @@ func pollFD(fd int, write bool) error {
 			return err
 		}
 		if n == 0 {
-			return unix.ETIMEDOUT
+			// Idle timeout: nothing ready yet. Keep waiting rather than killing
+			// a healthy tunnel.
+			continue
 		}
 		return nil
 	}

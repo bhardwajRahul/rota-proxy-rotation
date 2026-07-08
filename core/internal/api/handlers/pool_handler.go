@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/alpkeskin/rota/core/internal/models"
 	"github.com/alpkeskin/rota/core/internal/repository"
@@ -97,19 +96,25 @@ func (h *PoolHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(filters) > 0 {
 		if err := h.poolRepo.SetGeoFilters(r.Context(), pool.ID, filters); err != nil {
-			h.logger.Warn("failed to set geo filters", "pool_id", pool.ID, "error", err)
+			h.logger.Error("failed to set geo filters", "pool_id", pool.ID, "error", err)
+			http.Error(w, `{"error":"failed to persist geo filters"}`, http.StatusInternalServerError)
+			return
 		}
 	}
 	// ISP filters
 	if len(req.ISPFilters) > 0 {
 		if err := h.poolRepo.SetISPFilters(r.Context(), pool.ID, req.ISPFilters); err != nil {
-			h.logger.Warn("failed to set ISP filters", "pool_id", pool.ID, "error", err)
+			h.logger.Error("failed to set ISP filters", "pool_id", pool.ID, "error", err)
+			http.Error(w, `{"error":"failed to persist ISP filters"}`, http.StatusInternalServerError)
+			return
 		}
 	}
 	// Tag filters
 	if len(req.TagFilters) > 0 {
 		if err := h.poolRepo.SetTagFilters(r.Context(), pool.ID, req.TagFilters); err != nil {
-			h.logger.Warn("failed to set tag filters", "pool_id", pool.ID, "error", err)
+			h.logger.Error("failed to set tag filters", "pool_id", pool.ID, "error", err)
+			http.Error(w, `{"error":"failed to persist tag filters"}`, http.StatusInternalServerError)
+			return
 		}
 	}
 
@@ -154,7 +159,9 @@ func (h *PoolHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Update multi-geo filters if provided in request
 	if req.GeoFilters != nil {
 		if err := h.poolRepo.SetGeoFilters(r.Context(), id, req.GeoFilters); err != nil {
-			h.logger.Warn("failed to update geo filters", "pool_id", id, "error", err)
+			h.logger.Error("failed to update geo filters", "pool_id", id, "error", err)
+			http.Error(w, `{"error":"failed to persist geo filters"}`, http.StatusInternalServerError)
+			return
 		}
 		pool.GeoFilters = req.GeoFilters
 		filtersUpdated = true
@@ -162,7 +169,9 @@ func (h *PoolHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Update ISP filters if provided
 	if req.ISPFilters != nil {
 		if err := h.poolRepo.SetISPFilters(r.Context(), id, req.ISPFilters); err != nil {
-			h.logger.Warn("failed to update ISP filters", "pool_id", id, "error", err)
+			h.logger.Error("failed to update ISP filters", "pool_id", id, "error", err)
+			http.Error(w, `{"error":"failed to persist ISP filters"}`, http.StatusInternalServerError)
+			return
 		}
 		pool.ISPFilters = req.ISPFilters
 		filtersUpdated = true
@@ -170,7 +179,9 @@ func (h *PoolHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Update tag filters if provided
 	if req.TagFilters != nil {
 		if err := h.poolRepo.SetTagFilters(r.Context(), id, req.TagFilters); err != nil {
-			h.logger.Warn("failed to update tag filters", "pool_id", id, "error", err)
+			h.logger.Error("failed to update tag filters", "pool_id", id, "error", err)
+			http.Error(w, `{"error":"failed to persist tag filters"}`, http.StatusInternalServerError)
+			return
 		}
 		pool.TagFilters = req.TagFilters
 		filtersUpdated = true
@@ -481,8 +492,13 @@ func (h *PoolHandler) CreateAlertRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, rule)
 }
 
-// UpdateAlertRule updates an alert rule
+// UpdateAlertRule updates an alert rule (scoped to its owning pool)
 func (h *PoolHandler) UpdateAlertRule(w http.ResponseWriter, r *http.Request) {
+	poolID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
 	ruleID, err := strconv.Atoi(chi.URLParam(r, "rule_id"))
 	if err != nil {
 		http.Error(w, `{"error":"invalid rule_id"}`, http.StatusBadRequest)
@@ -493,7 +509,7 @@ func (h *PoolHandler) UpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
-	rule, err := h.poolRepo.UpdateAlertRule(r.Context(), ruleID, req)
+	rule, err := h.poolRepo.UpdateAlertRule(r.Context(), poolID, ruleID, req)
 	if err != nil || rule == nil {
 		http.Error(w, `{"error":"rule not found or update failed"}`, http.StatusNotFound)
 		return
@@ -501,14 +517,19 @@ func (h *PoolHandler) UpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rule)
 }
 
-// DeleteAlertRule deletes an alert rule
+// DeleteAlertRule deletes an alert rule (scoped to its owning pool)
 func (h *PoolHandler) DeleteAlertRule(w http.ResponseWriter, r *http.Request) {
+	poolID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
 	ruleID, err := strconv.Atoi(chi.URLParam(r, "rule_id"))
 	if err != nil {
 		http.Error(w, `{"error":"invalid rule_id"}`, http.StatusBadRequest)
 		return
 	}
-	if err := h.poolRepo.DeleteAlertRule(r.Context(), ruleID); err != nil {
+	if err := h.poolRepo.DeleteAlertRule(r.Context(), poolID, ruleID); err != nil {
 		http.Error(w, `{"error":"failed to delete alert rule"}`, http.StatusInternalServerError)
 		return
 	}
@@ -517,47 +538,22 @@ func (h *PoolHandler) DeleteAlertRule(w http.ResponseWriter, r *http.Request) {
 
 // GetISPList returns unique ISPs from proxy table for filter builder UI
 func (h *PoolHandler) GetISPList(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query().Get("q")
-	// Simple distinct query with optional search
-	rows, err := h.poolRepo.GetDB().Pool.Query(r.Context(),
-		`SELECT DISTINCT isp FROM proxies WHERE isp IS NOT NULL AND isp ILIKE $1 ORDER BY isp LIMIT 50`,
-		"%"+q+"%")
+	isps, err := h.poolRepo.GetDistinctISPs(r.Context(), r.URL.Query().Get("q"))
 	if err != nil {
+		h.logger.Error("failed to get ISPs", "error", err)
 		http.Error(w, `{"error":"failed to get ISPs"}`, http.StatusInternalServerError)
 		return
-	}
-	defer rows.Close()
-	var isps []string
-	for rows.Next() {
-		var isp string
-		if err := rows.Scan(&isp); err == nil && strings.TrimSpace(isp) != "" {
-			isps = append(isps, isp)
-		}
-	}
-	if isps == nil {
-		isps = []string{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"isps": isps})
 }
 
 // GetTagList returns unique proxy tags for filter builder UI
 func (h *PoolHandler) GetTagList(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.poolRepo.GetDB().Pool.Query(r.Context(),
-		`SELECT DISTINCT unnest(tags) AS tag FROM proxies WHERE array_length(tags,1) > 0 ORDER BY tag LIMIT 100`)
+	tags, err := h.poolRepo.GetDistinctTags(r.Context())
 	if err != nil {
+		h.logger.Error("failed to get tags", "error", err)
 		http.Error(w, `{"error":"failed to get tags"}`, http.StatusInternalServerError)
 		return
-	}
-	defer rows.Close()
-	var tags []string
-	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err == nil && strings.TrimSpace(tag) != "" {
-			tags = append(tags, tag)
-		}
-	}
-	if tags == nil {
-		tags = []string{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"tags": tags})
 }

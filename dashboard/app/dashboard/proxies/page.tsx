@@ -100,14 +100,14 @@ export default function ProxiesPage() {
 
   const [newProxy, setNewProxy] = React.useState({
     address: "",
-    protocol: "http" as "http" | "https" | "socks5",
+    protocol: "http" as "http" | "https" | "socks4" | "socks4a" | "socks5",
     username: "",
     password: "",
   })
 
   // Import modal states
   const [importFile, setImportFile] = React.useState<File | null>(null)
-  const [importProtocol, setImportProtocol] = React.useState<"http" | "https" | "socks5">("http")
+  const [importProtocol, setImportProtocol] = React.useState<"http" | "https" | "socks4" | "socks4a" | "socks5">("http")
   const [importUsername, setImportUsername] = React.useState("")
   const [importPassword, setImportPassword] = React.useState("")
   const [parsedProxies, setParsedProxies] = React.useState<string[]>([])
@@ -233,14 +233,22 @@ export default function ProxiesPage() {
     }
   }
 
+  // Map selected row indices to proxy ids, skipping rows that no longer exist
+  // (the table data may have shrunk between selection and confirm).
+  const getSelectedProxyIds = () =>
+    Object.keys(rowSelection)
+      .map(key => data[Number(key)])
+      .filter((proxy): proxy is Proxy => proxy != null)
+      .map(proxy => proxy.id)
+
   const handleBulkDelete = async () => {
-    const selectedIds = Object.keys(rowSelection).map(key => data[Number(key)].id)
+    const selectedIds = getSelectedProxyIds()
     if (selectedIds.length === 0) return
     setBulkDeleteConfirm(true)
   }
 
   const confirmBulkDelete = async () => {
-    const selectedIds = Object.keys(rowSelection).map(key => data[Number(key)].id)
+    const selectedIds = getSelectedProxyIds()
 
     try {
       await api.bulkDeleteProxies({ ids: selectedIds })
@@ -304,6 +312,9 @@ export default function ProxiesPage() {
 
       setParsedProxies(lines)
       setImportFile(file)
+    }
+    reader.onerror = () => {
+      toast.error('Failed to read file', 'The selected file could not be read. Please try again.')
     }
     reader.readAsText(file)
   }
@@ -552,6 +563,17 @@ export default function ProxiesPage() {
     {
       accessorKey: "last_check",
       header: "Last Check",
+      cell: ({ row }) => {
+        const raw = row.getValue("last_check") as string | null | undefined
+        if (!raw || raw === "idle") {
+          return <div className="text-muted-foreground">—</div>
+        }
+        const date = new Date(raw)
+        if (isNaN(date.getTime())) {
+          return <div className="text-muted-foreground">{raw}</div>
+        }
+        return <div suppressHydrationWarning>{date.toLocaleString()}</div>
+      },
     },
     {
       id: "actions",

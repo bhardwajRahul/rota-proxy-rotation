@@ -61,15 +61,11 @@ func connectViaHTTPStandalone(p *models.Proxy, host string, timeout time.Duratio
 		return nil, fmt.Errorf("send CONNECT to %s: %w", p.Address, err)
 	}
 
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	line, err := readCONNECTResponse(conn)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read CONNECT response from %s: %w", p.Address, err)
 	}
-
-	resp := string(buf[:n])
-	line := strings.SplitN(resp, "\r\n", 2)[0]
 	if !strings.Contains(line, "200") {
 		conn.Close()
 		return nil, fmt.Errorf("CONNECT to %s rejected: %s", p.Address, line)
@@ -77,4 +73,45 @@ func connectViaHTTPStandalone(p *models.Proxy, host string, timeout time.Duratio
 
 	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
+}
+
+// readCONNECTResponse reads the upstream proxy's CONNECT reply up to the end of
+// the header block (\r\n\r\n) WITHOUT consuming any bytes that belong to the
+// tunnelled stream, and returns the status line.
+//
+// Reading into a large buffer (or via a bufio.Reader) can swallow the first
+// bytes of the target server's TLS ServerHello when the proxy pipelines them
+// right after the "200 Connection established" response — those bytes then
+// never reach the client and the TLS handshake fails (issue #19). Since a
+// CONNECT response has no body, the header terminator is a hard boundary, so we
+// read one byte at a time until \r\n\r\n and stop exactly there. The response
+// is tiny, so the extra syscalls are negligible.
+func readCONNECTResponse(conn net.Conn) (string, error) {
+	var buf []byte
+	b := make([]byte, 1)
+	for {
+		n, err := conn.Read(b)
+		if n > 0 {
+			buf = append(buf, b[0])
+			if l := len(buf); l >= 4 &&
+				buf[l-4] == '\r' && buf[l-3] == '\n' &&
+				buf[l-2] == '\r' && buf[l-1] == '\n' {
+				break
+			}
+			if len(buf) > 8192 {
+				return "", fmt.Errorf("CONNECT response headers too large")
+			}
+		}
+		if err != nil {
+			if len(buf) > 0 {
+				break // return what we have; caller validates the status line
+			}
+			return "", err
+		}
+	}
+	statusLine := string(buf)
+	if idx := strings.Index(statusLine, "\r\n"); idx >= 0 {
+		statusLine = statusLine[:idx]
+	}
+	return statusLine, nil
 }

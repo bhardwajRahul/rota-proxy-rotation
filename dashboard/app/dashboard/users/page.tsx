@@ -7,6 +7,7 @@ import {
 } from "lucide-react"
 import { toast } from "sonner"
 import { api } from "@/lib/api"
+import { PROXY_PORT } from "@/lib/config"
 import { ProxyUser, ProxyPool, CreateProxyUserRequest } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -151,7 +152,7 @@ export default function UsersPage() {
 
   const copyProxyURL = (u: ProxyUser) => {
     const host = window.location.hostname
-    const url = `http://${u.username}:***@${host}:8000`
+    const url = `http://${u.username}:***@${host}:${PROXY_PORT}`
     navigator.clipboard.writeText(url)
     toast.success("Proxy URL copied (replace *** with password)")
   }
@@ -171,7 +172,7 @@ export default function UsersPage() {
         <div>
           <h1 className="text-2xl font-bold">Proxy Users</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Each user authenticates to <code className="text-xs bg-muted px-1 rounded">:8000</code> and is routed
+            Each user authenticates to <code className="text-xs bg-muted px-1 rounded">:{PROXY_PORT}</code> and is routed
             through their assigned pool chain. Requests auto-fail over to backup pools.
           </p>
         </div>
@@ -189,7 +190,7 @@ export default function UsersPage() {
               <ShieldCheck className="h-4 w-4 mt-0.5 shrink-0 text-primary" />
               <div>
                 <div className="font-medium text-foreground">Auth via Proxy-Authorization</div>
-                <div>Use <code className="text-xs">http://user:pass@&lt;your-host&gt;:8000</code> in your client</div>
+                <div>Use <code className="text-xs">http://user:pass@&lt;your-host&gt;:{PROXY_PORT}</code> in your client</div>
               </div>
             </div>
             <div className="flex items-start gap-2">

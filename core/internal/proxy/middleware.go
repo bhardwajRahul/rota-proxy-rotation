@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -25,6 +27,13 @@ func NewAuthMiddleware(settings models.AuthenticationSettings) *AuthMiddleware {
 		username: settings.Username,
 		password: settings.Password,
 	}
+}
+
+// IsEnabled reports whether legacy single-user auth is currently enforcing.
+func (m *AuthMiddleware) IsEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.enabled
 }
 
 // UpdateSettings updates the authentication settings
@@ -72,8 +81,12 @@ func (m *AuthMiddleware) HandleRequest(req *http.Request) (*http.Request, *http.
 	username := credentials[0]
 	password := credentials[1]
 
-	// Validate credentials
-	if username != m.username || password != m.password {
+	// Validate credentials using constant-time comparison to avoid leaking
+	// which field mismatched via timing. Both comparisons always run (bitwise
+	// AND, not short-circuit) so timing doesn't reveal username vs password.
+	userMatch := subtle.ConstantTimeCompare([]byte(username), []byte(m.username))
+	passMatch := subtle.ConstantTimeCompare([]byte(password), []byte(m.password))
+	if userMatch&passMatch != 1 {
 		return req, m.unauthorized()
 	}
 
@@ -158,6 +171,14 @@ func (m *RateLimitMiddleware) allow(clientIP string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Guard against misconfiguration: a non-positive interval would make rps
+	// +Inf (rate.NewLimiter panics / never limits) and a non-positive
+	// maxRequests would set burst to 0 (denies every request). Treat either
+	// case as "limiter effectively disabled" and allow the request through.
+	if m.interval <= 0 || m.maxRequests <= 0 {
+		return true
+	}
+
 	// Get or create limiter for this IP
 	limiter, exists := m.limiters[clientIP]
 	if !exists {
@@ -171,28 +192,25 @@ func (m *RateLimitMiddleware) allow(clientIP string) bool {
 	return limiter.Allow()
 }
 
-// getClientIP extracts the client IP from the request
+// getClientIP extracts the client IP used as the per-IP rate-limit key.
+//
+// SECURITY (AUD-20): X-Forwarded-For / X-Real-IP are supplied by the caller and
+// are trivially spoofable on a forward proxy — trusting them lets a client
+// bypass the limit by rotating the header value. We therefore key on the real
+// socket peer (RemoteAddr) only.
+//
+// TODO: there is currently no trusted-proxy setting. If one is added, honor the
+// forwarded headers only when the immediate peer (RemoteAddr) is in the trusted
+// set; until then, always use RemoteAddr.
 func (m *RateLimitMiddleware) getClientIP(req *http.Request) string {
-	// Try X-Forwarded-For header first
-	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
-		}
+	// Use net.SplitHostPort so bare IPv6 addresses (which contain colons) are
+	// handled correctly (AUD-36). Fall back to the raw value when there is no
+	// port or the address is malformed.
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		return req.RemoteAddr
 	}
-
-	// Try X-Real-IP header
-	if xri := req.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	// Fall back to RemoteAddr
-	ip := req.RemoteAddr
-	// Remove port if present
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		ip = ip[:idx]
-	}
-	return ip
+	return host
 }
 
 // tooManyRequests returns a 429 Too Many Requests response

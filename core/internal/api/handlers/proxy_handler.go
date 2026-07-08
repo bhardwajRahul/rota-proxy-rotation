@@ -25,6 +25,10 @@ type ProxyHandler struct {
 	proxyRepo     *repository.ProxyRepository
 	healthChecker HealthChecker
 	logger        *logger.Logger
+
+	// invalidateCache clears the proxy engine's transport cache after a proxy
+	// is changed/removed so stale credentials aren't reused (AUD-16). Optional.
+	invalidateCache func()
 }
 
 // NewProxyHandler creates a new ProxyHandler
@@ -33,6 +37,19 @@ func NewProxyHandler(proxyRepo *repository.ProxyRepository, healthChecker Health
 		proxyRepo:     proxyRepo,
 		healthChecker: healthChecker,
 		logger:        log,
+	}
+}
+
+// SetCacheInvalidator wires a callback invoked after proxy mutations to drop
+// cached upstream transports (AUD-16).
+func (h *ProxyHandler) SetCacheInvalidator(fn func()) {
+	h.invalidateCache = fn
+}
+
+// onProxyChange invalidates the transport cache if a callback is wired.
+func (h *ProxyHandler) onProxyChange() {
+	if h.invalidateCache != nil {
+		h.invalidateCache()
 	}
 }
 
@@ -224,6 +241,7 @@ func (h *ProxyHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.onProxyChange()
 	h.jsonResponse(w, http.StatusOK, proxy)
 }
 
@@ -250,6 +268,7 @@ func (h *ProxyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.onProxyChange()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -288,6 +307,8 @@ func (h *ProxyHandler) BulkDelete(w http.ResponseWriter, r *http.Request) {
 		h.errorResponse(w, http.StatusInternalServerError, "Failed to delete proxies")
 		return
 	}
+
+	h.onProxyChange()
 
 	response := map[string]interface{}{
 		"deleted": deleted,
@@ -368,12 +389,21 @@ func (h *ProxyHandler) Export(w http.ResponseWriter, r *http.Request) {
 
 	status := r.URL.Query().Get("status")
 
-	// Get all proxies
-	proxies, _, err := h.proxyRepo.List(r.Context(), 1, 10000, "", status, "", "created_at", "asc")
+	// Get all proxies (capped to bound memory/response size)
+	const exportCap = 10000
+	proxies, total, err := h.proxyRepo.List(r.Context(), 1, exportCap, "", status, "", "created_at", "asc")
 	if err != nil {
 		h.logger.Error("failed to get proxies for export", "error", err)
 		h.errorResponse(w, http.StatusInternalServerError, "Failed to export proxies")
 		return
+	}
+
+	// Signal silent truncation so clients know the export is incomplete.
+	if total > exportCap {
+		h.logger.Warn("proxy export truncated", "returned", len(proxies), "total", total, "cap", exportCap)
+		w.Header().Set("X-Export-Truncated", "true")
+		w.Header().Set("X-Export-Total", strconv.Itoa(total))
+		w.Header().Set("X-Export-Returned", strconv.Itoa(len(proxies)))
 	}
 
 	switch format {
@@ -433,6 +463,7 @@ func (h *ProxyHandler) DeleteAll(w http.ResponseWriter, r *http.Request) {
 		h.errorResponse(w, http.StatusInternalServerError, "Failed to delete all proxies")
 		return
 	}
+	h.onProxyChange()
 	h.jsonResponse(w, http.StatusOK, map[string]interface{}{"deleted": deleted})
 }
 

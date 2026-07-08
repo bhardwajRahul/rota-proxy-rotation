@@ -29,7 +29,12 @@ import {
   CreatePoolAlertRuleRequest,
 } from "./types"
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001"
+// Empty by default → same-origin: the browser calls /api and /ws on whatever
+// host serves the dashboard, and the bundled reverse proxy forwards them to the
+// core. This removes the build-time API URL that used to break remote logins.
+// For `pnpm dev` (dashboard and core on separate ports), set
+// NEXT_PUBLIC_API_URL=http://localhost:8001 in dashboard/.env.local.
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || ""
 
 class ApiClient {
   private baseUrl: string
@@ -448,10 +453,19 @@ class ApiClient {
   }
 
   // ── Pool Export ──────────────────────────────────────────────────────────
-  getPoolExportUrl(poolId: number, format: "txt" | "csv" = "txt"): string {
-    const base = typeof window !== "undefined" ? window.location.origin : API_BASE_URL
-    const token = this.token
-    return `${base}/api/v1/pools/${poolId}/export?format=${format}${token ? `&token=${token}` : ""}`
+  async exportPool(poolId: number, format: "txt" | "csv" = "txt"): Promise<Blob> {
+    const response = await fetch(
+      `${this.baseUrl}/api/v1/pools/${poolId}/export?format=${format}`,
+      {
+        headers: this.getHeaders(),
+      }
+    )
+
+    if (!response.ok) {
+      throw new Error("Export failed")
+    }
+
+    return response.blob()
   }
 
   // ── Alert Rules ──────────────────────────────────────────────────────────
@@ -490,19 +504,75 @@ class ApiClient {
     return data.tags
   }
 
-  // WebSocket connections
-  createDashboardWebSocket(onMessage: (data: DashboardStats) => void): WebSocket {
-    const wsUrl = this.baseUrl.replace(/^http/, "ws")
-    const ws = new WebSocket(`${wsUrl}/ws/dashboard${this.token ? `?token=${this.token}` : ""}`)
+  // wsBase returns the ws(s):// origin for WebSocket connections.
+  // When baseUrl is set (dev) it mirrors it; otherwise it derives a same-origin
+  // URL from the current page so wss is used automatically under HTTPS.
+  private wsBase(): string {
+    if (this.baseUrl) return this.baseUrl.replace(/^http/, "ws")
+    if (typeof window !== "undefined") {
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:"
+      return `${proto}//${window.location.host}`
+    }
+    return ""
+  }
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      if (data.type === "stats_update") {
-        onMessage(data.data)
+  // WebSocket connections
+  //
+  // Dashboard socket auto-reconnects with exponential backoff so live stats
+  // resume after a transient drop. It returns a small handle instead of the raw
+  // WebSocket because the underlying socket is replaced on each reconnect;
+  // callers close the handle to tear everything down.
+  createDashboardWebSocket(
+    onMessage: (data: DashboardStats) => void
+  ): { close: () => void } {
+    let ws: WebSocket | null = null
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let attempts = 0
+    let closed = false
+
+    const connect = () => {
+      if (closed) return
+      // TODO(AUD-22): the auth token is passed in the query string, so it can
+      // leak into proxy/access logs. Once the backend accepts a short-lived
+      // ticket or a Sec-WebSocket-Protocol subprotocol, pass the token via the
+      // second `new WebSocket(url, protocols)` argument instead of the URL.
+      const url = `${this.wsBase()}/ws/dashboard${this.token ? `?token=${this.token}` : ""}`
+      ws = new WebSocket(url)
+
+      ws.onopen = () => {
+        attempts = 0
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          if (data.type === "stats_update") {
+            onMessage(data.data)
+          }
+        } catch {
+          // Ignore malformed (non-JSON) frames rather than throwing, which
+          // would otherwise silently kill the onmessage handler.
+        }
+      }
+
+      ws.onclose = () => {
+        if (closed) return
+        // Exponential backoff, capped at 30s.
+        const delay = Math.min(1000 * 2 ** attempts, 30000)
+        attempts++
+        reconnectTimer = setTimeout(connect, delay)
       }
     }
 
-    return ws
+    connect()
+
+    return {
+      close: () => {
+        closed = true
+        if (reconnectTimer) clearTimeout(reconnectTimer)
+        ws?.close()
+      },
+    }
   }
 
   createLogsWebSocket(
@@ -510,7 +580,11 @@ class ApiClient {
     levels?: string[],
     source?: string
   ): WebSocket {
-    const wsUrl = this.baseUrl.replace(/^http/, "ws")
+    const wsUrl = this.wsBase()
+    // TODO(AUD-22): the auth token is passed in the query string, so it can leak
+    // into proxy/access logs. Once the backend accepts a short-lived ticket or a
+    // Sec-WebSocket-Protocol subprotocol, pass the token via the second
+    // `new WebSocket(url, protocols)` argument instead of the URL.
     const ws = new WebSocket(`${wsUrl}/ws/logs${this.token ? `?token=${this.token}` : ""}`)
 
     ws.onopen = () => {
@@ -524,8 +598,12 @@ class ApiClient {
     }
 
     ws.onmessage = (event) => {
-      const log = JSON.parse(event.data)
-      onMessage(log)
+      try {
+        const log = JSON.parse(event.data)
+        onMessage(log)
+      } catch {
+        // Ignore malformed (non-JSON) frames.
+      }
     }
 
     return ws

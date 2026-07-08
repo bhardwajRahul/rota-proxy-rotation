@@ -5,9 +5,13 @@ WORKDIR /app
 # Install pnpm
 RUN corepack enable && corepack prepare pnpm@10.19.0 --activate
 
-# Install dependencies based on the preferred package manager
+# Install dependencies based on the preferred package manager.
+# --package-import-method=copy avoids pnpm's default hardlinking, which fails on
+# filesystems that don't support cross-file hardlinks in the build layer (e.g.
+# ZFS) — see issue #23. node_modules is discarded in the multi-stage build, so
+# the extra copy cost is negligible.
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --package-import-method=copy
 
 # Stage 2: Builder
 FROM node:20-alpine AS builder
@@ -26,6 +30,10 @@ ENV NODE_ENV=production
 # Accept build-time API URL (baked into Next.js static bundle)
 ARG NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+
+# Proxy port shown in copy-able proxy URLs (baked into the bundle at build time)
+ARG NEXT_PUBLIC_PROXY_PORT
+ENV NEXT_PUBLIC_PROXY_PORT=${NEXT_PUBLIC_PROXY_PORT}
 
 # Build the application
 RUN pnpm run build

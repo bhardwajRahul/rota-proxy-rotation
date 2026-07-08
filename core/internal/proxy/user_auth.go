@@ -30,8 +30,8 @@ var UserChainContextKey = userChainKey{}
 // userEntry caches a resolved PoolChain and the verified password hash for a user.
 // This avoids bcrypt on every request — bcrypt only runs on first auth or after TTL expiry.
 type userEntry struct {
-	chain          *PoolChain
-	expiresAt      time.Time
+	chain     *PoolChain
+	expiresAt time.Time
 	// passwordHash is the bcrypt hash we verified against. If the user changes their
 	// password the hash changes, causing a cache miss on next TTL expiry.
 	verifiedPwHash string
@@ -54,6 +54,11 @@ type UserAuthMiddleware struct {
 	// cache: username -> userEntry (TTL 60s)
 	mu    sync.RWMutex
 	cache map[string]userEntry
+
+	// usersConfigured caches whether any proxy_users exist (TTL 30s). Used by the
+	// no-credentials path to decide whether an unauthenticated request may pass.
+	usersConfigured   bool
+	usersCheckedUntil time.Time
 }
 
 // NewUserAuthMiddleware creates the middleware.
@@ -85,22 +90,38 @@ func NewUserAuthMiddleware(
 func (m *UserAuthMiddleware) HandleRequest(req *http.Request) (*http.Request, *http.Response) {
 	username, password, ok := parseProxyAuth(req)
 	if !ok {
-		// No credentials provided — check legacy auth
-		return m.legacy.HandleRequest(req)
+		// No credentials provided. Delegate to legacy single-user auth if enabled.
+		if m.legacy != nil && m.legacy.IsEnabled() {
+			if _, resp := m.legacy.HandleRequest(req); resp != nil {
+				// Legacy is enabled and demands authentication → 407.
+				return req, resp
+			}
+		}
+		// Legacy is disabled (or absent). If proxy_users are configured, an
+		// unauthenticated request must NOT be allowed through — otherwise this
+		// would be an auth bypass (AUD-1). Only a fully-unconfigured proxy (no
+		// legacy auth, no proxy_users) stays open.
+		if m.hasProxyUsers(req.Context()) {
+			return req, unauthorized()
+		}
+		return req, nil
 	}
 
 	chain, err := m.resolve(req.Context(), username, password)
 	if err != nil {
 		m.logger.Warn("user auth failed", "username", username, "err", err)
-		// If legacy auth is enabled and credentials don't match a proxy_user,
-		// still try the legacy path (single admin user)
-		if m.legacy != nil {
+		// Credentials were supplied but didn't match a proxy_user. Fall back to
+		// legacy single-user auth ONLY when it is actually enforcing (AUD-1):
+		// if legacy is disabled we must reject, never allow through.
+		if m.legacy != nil && m.legacy.IsEnabled() {
+			// Legacy enabled: it authoritatively accepts (nil) or rejects (407).
 			if _, resp := m.legacy.HandleRequest(req); resp != nil {
 				return req, resp
 			}
 			// legacy auth passed with these same credentials → allow without pool chain
 			return req, nil
 		}
+		// No valid auth path for these credentials → reject.
 		return req, unauthorized()
 	}
 
@@ -196,20 +217,67 @@ func (m *UserAuthMiddleware) buildChain(ctx context.Context, user *models.ProxyU
 	return chain, nil
 }
 
-// refreshLoop periodically refreshes all cached chains so new proxies become available.
+// hasProxyUsers reports whether any proxy_users are configured, with a 30s TTL
+// cache so the no-credentials hot path doesn't hit the DB on every request.
+func (m *UserAuthMiddleware) hasProxyUsers(ctx context.Context) bool {
+	m.mu.RLock()
+	fresh := time.Now().Before(m.usersCheckedUntil)
+	cached := m.usersConfigured
+	m.mu.RUnlock()
+	if fresh {
+		return cached
+	}
+
+	users, err := m.userRepo.List(ctx)
+	if err != nil {
+		// On error keep the last known value (fail toward the previous decision).
+		return cached
+	}
+	has := len(users) > 0
+
+	m.mu.Lock()
+	m.usersConfigured = has
+	m.usersCheckedUntil = time.Now().Add(30 * time.Second)
+	m.mu.Unlock()
+	return has
+}
+
+// refreshLoop periodically refreshes cached chains that are still live and evicts
+// entries whose TTL has expired so the cache can't grow unbounded (AUD-19).
 func (m *UserAuthMiddleware) refreshLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		now := time.Now()
+
+		// Snapshot live (non-expired) entries; collect expired usernames for eviction.
 		m.mu.RLock()
-		entries := make(map[string]userEntry, len(m.cache))
+		live := make([]userEntry, 0, len(m.cache))
+		var expired []string
 		for k, v := range m.cache {
-			entries[k] = v
+			if now.After(v.expiresAt) {
+				expired = append(expired, k)
+				continue
+			}
+			live = append(live, v)
 		}
 		m.mu.RUnlock()
 
-		for _, entry := range entries {
+		// Evict expired entries.
+		if len(expired) > 0 {
+			m.mu.Lock()
+			for _, k := range expired {
+				// Re-check under the write lock in case it was refreshed since the snapshot.
+				if e, ok := m.cache[k]; ok && now.After(e.expiresAt) {
+					delete(m.cache, k)
+				}
+			}
+			m.mu.Unlock()
+		}
+
+		// Refresh chains still in use so new proxies become available.
+		for _, entry := range live {
 			entry.chain.Refresh(ctx)
 		}
 		cancel()

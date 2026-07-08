@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/models"
@@ -266,21 +267,55 @@ func (r *PoolRepository) GetProxies(ctx context.Context, poolID int) ([]models.P
 	return proxies, nil
 }
 
-// AddProxies adds proxy IDs to a pool (idempotent)
+// AddProxies adds proxy IDs to a pool (idempotent).
+//
+// The insert is a single INSERT ... SELECT that only picks proxy IDs still
+// present in the proxies table. This makes it race-safe against
+// ProxyCleanupService: the SELECT takes FK row locks (FOR KEY SHARE) on the
+// referenced proxies, so a proxy deleted concurrently is simply skipped
+// instead of triggering a pool_proxies_proxy_id_fkey violation (issue #39).
+// ON CONFLICT DO NOTHING keeps it idempotent for already-present rows.
 func (r *PoolRepository) AddProxies(ctx context.Context, poolID int, proxyIDs []int) error {
 	if len(proxyIDs) == 0 {
 		return nil
 	}
-	for _, pid := range proxyIDs {
-		_, err := r.db.Pool.Exec(ctx,
-			`INSERT INTO pool_proxies (pool_id, proxy_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-			poolID, pid,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to add proxy %d to pool: %w", pid, err)
-		}
+	_, err := r.db.Pool.Exec(ctx, `
+		INSERT INTO pool_proxies (pool_id, proxy_id)
+		SELECT $1, id FROM proxies WHERE id = ANY($2)
+		ON CONFLICT DO NOTHING`,
+		poolID, proxyIDs,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to add proxies to pool: %w", err)
 	}
 	return nil
+}
+
+// rebuildMembership atomically replaces a pool's membership with the given
+// proxy IDs inside a single transaction. Running the clear + insert together
+// means concurrent readers (e.g. the List/GetByID count queries or the alert
+// watcher) never observe a half-cleared pool, which previously caused
+// transient wrong proxy counts (issue #34). The FK-safe INSERT ... SELECT also
+// prevents the delete/insert race with ProxyCleanupService (issue #39).
+func (r *PoolRepository) rebuildMembership(ctx context.Context, poolID int, ids []int) error {
+	tx, err := r.db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin sync tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after successful commit
+
+	if _, err := tx.Exec(ctx, `DELETE FROM pool_proxies WHERE pool_id = $1`, poolID); err != nil {
+		return fmt.Errorf("failed to clear pool membership: %w", err)
+	}
+	if len(ids) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pool_proxies (pool_id, proxy_id)
+			SELECT $1, id FROM proxies WHERE id = ANY($2)
+			ON CONFLICT DO NOTHING`, poolID, ids); err != nil {
+			return fmt.Errorf("failed to insert pool membership: %w", err)
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // RemoveProxies removes specific proxy IDs from a pool
@@ -321,22 +356,27 @@ func (r *PoolRepository) GetGeoFilters(ctx context.Context, poolID int) ([]model
 	return filters, nil
 }
 
-// SetGeoFilters replaces all geo filters for a pool atomically
+// SetGeoFilters replaces all geo filters for a pool atomically.
+// The delete + inserts run in one transaction so a mid-loop failure never
+// leaves the pool with partial/empty filters (see rebuildMembership pattern).
 func (r *PoolRepository) SetGeoFilters(ctx context.Context, poolID int, filters []models.GeoFilter) error {
-	_, err := r.db.Pool.Exec(ctx, `DELETE FROM pool_geo_filters WHERE pool_id=$1`, poolID)
+	tx, err := r.db.Pool.Begin(ctx)
 	if err != nil {
+		return fmt.Errorf("failed to begin geo filters tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after successful commit
+
+	if _, err := tx.Exec(ctx, `DELETE FROM pool_geo_filters WHERE pool_id=$1`, poolID); err != nil {
 		return err
 	}
 	for _, f := range filters {
-		city := f.CityName
-		_, err := r.db.Pool.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO pool_geo_filters (pool_id, country_code, city_name) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-			poolID, f.CountryCode, city)
-		if err != nil {
+			poolID, f.CountryCode, f.CityName); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // SyncPoolByGeo rebuilds pool membership based on geo filters (pool_geo_filters table + legacy single filter)
@@ -363,7 +403,11 @@ func (r *PoolRepository) SyncPoolByGeo(ctx context.Context, pool models.ProxyPoo
 	// Collect proxy IDs matching ANY of the filters (OR logic)
 	idSet := make(map[int]bool)
 	for _, f := range filters {
-		var rows interface{ Next() bool; Scan(...interface{}) error; Close() }
+		var rows interface {
+			Next() bool
+			Scan(...interface{}) error
+			Close()
+		}
 		var qerr error
 		if f.CityName != "" {
 			rows, qerr = r.db.Pool.Query(ctx,
@@ -393,10 +437,7 @@ func (r *PoolRepository) SyncPoolByGeo(ctx context.Context, pool models.ProxyPoo
 		ids = append(ids, id)
 	}
 
-	if err := r.ClearProxies(ctx, pool.ID); err != nil {
-		return 0, err
-	}
-	if err := r.AddProxies(ctx, pool.ID, ids); err != nil {
+	if err := r.rebuildMembership(ctx, pool.ID, ids); err != nil {
 		return 0, err
 	}
 	return len(ids), nil
@@ -576,19 +617,27 @@ func (r *PoolRepository) GetISPFilters(ctx context.Context, poolID int) ([]strin
 	return isps, nil
 }
 
-// SetISPFilters replaces all ISP filters for a pool
+// SetISPFilters replaces all ISP filters for a pool atomically.
+// The delete + inserts run in one transaction so a mid-loop failure never
+// leaves the pool with partial/empty filters.
 func (r *PoolRepository) SetISPFilters(ctx context.Context, poolID int, isps []string) error {
-	if _, err := r.db.Pool.Exec(ctx, `DELETE FROM pool_isp_filters WHERE pool_id=$1`, poolID); err != nil {
+	tx, err := r.db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin ISP filters tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after successful commit
+
+	if _, err := tx.Exec(ctx, `DELETE FROM pool_isp_filters WHERE pool_id=$1`, poolID); err != nil {
 		return err
 	}
 	for _, isp := range isps {
-		if _, err := r.db.Pool.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO pool_isp_filters (pool_id, isp) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
 			poolID, isp); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // --- Tag Filters ---
@@ -612,19 +661,27 @@ func (r *PoolRepository) GetTagFilters(ctx context.Context, poolID int) ([]strin
 	return tags, nil
 }
 
-// SetTagFilters replaces all tag filters for a pool
+// SetTagFilters replaces all tag filters for a pool atomically.
+// The delete + inserts run in one transaction so a mid-loop failure never
+// leaves the pool with partial/empty filters.
 func (r *PoolRepository) SetTagFilters(ctx context.Context, poolID int, tags []string) error {
-	if _, err := r.db.Pool.Exec(ctx, `DELETE FROM pool_tag_filters WHERE pool_id=$1`, poolID); err != nil {
+	tx, err := r.db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin tag filters tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after successful commit
+
+	if _, err := tx.Exec(ctx, `DELETE FROM pool_tag_filters WHERE pool_id=$1`, poolID); err != nil {
 		return err
 	}
 	for _, tag := range tags {
-		if _, err := r.db.Pool.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO pool_tag_filters (pool_id, tag) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
 			poolID, tag); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // SyncPoolByFilters rebuilds pool membership using geo + ISP + tag filters combined.
@@ -746,10 +803,7 @@ func (r *PoolRepository) SyncPoolByFilters(ctx context.Context, pool models.Prox
 		}
 	}
 
-	if err := r.ClearProxies(ctx, pool.ID); err != nil {
-		return 0, nil, err
-	}
-	if err := r.AddProxies(ctx, pool.ID, ids); err != nil {
+	if err := r.rebuildMembership(ctx, pool.ID, ids); err != nil {
 		return 0, nil, err
 	}
 	return len(ids), newIDs, nil
@@ -838,8 +892,10 @@ func (r *PoolRepository) CreateAlertRule(ctx context.Context, poolID int, req mo
 	return &rule, nil
 }
 
-// UpdateAlertRule updates an alert rule
-func (r *PoolRepository) UpdateAlertRule(ctx context.Context, ruleID int, req models.CreatePoolAlertRuleRequest) (*models.PoolAlertRule, error) {
+// UpdateAlertRule updates an alert rule. The update is scoped by both pool_id
+// and rule id so a rule can only be edited through its owning pool's URL
+// (prevents cross-pool tampering). Returns (nil, nil) if no matching rule.
+func (r *PoolRepository) UpdateAlertRule(ctx context.Context, poolID, ruleID int, req models.CreatePoolAlertRuleRequest) (*models.PoolAlertRule, error) {
 	var rule models.PoolAlertRule
 	err := r.db.Pool.QueryRow(ctx, `
 		UPDATE pool_alert_rules SET
@@ -849,10 +905,10 @@ func (r *PoolRepository) UpdateAlertRule(ctx context.Context, ruleID int, req mo
 			webhook_method    = CASE WHEN $4 <> '' THEN $4 ELSE webhook_method END,
 			cooldown_minutes  = CASE WHEN $5 > 0 THEN $5 ELSE cooldown_minutes END,
 			updated_at        = NOW()
-		WHERE id = $6
+		WHERE id = $6 AND pool_id = $7
 		RETURNING id, pool_id, enabled, min_active_proxies, webhook_url, webhook_method,
 		          last_fired_at, cooldown_minutes, created_at, updated_at`,
-		req.Enabled, req.MinActiveProxies, req.WebhookURL, req.WebhookMethod, req.CooldownMinutes, ruleID,
+		req.Enabled, req.MinActiveProxies, req.WebhookURL, req.WebhookMethod, req.CooldownMinutes, ruleID, poolID,
 	).Scan(
 		&rule.ID, &rule.PoolID, &rule.Enabled, &rule.MinActiveProxies,
 		&rule.WebhookURL, &rule.WebhookMethod, &rule.LastFiredAt,
@@ -867,9 +923,10 @@ func (r *PoolRepository) UpdateAlertRule(ctx context.Context, ruleID int, req mo
 	return &rule, nil
 }
 
-// DeleteAlertRule deletes an alert rule
-func (r *PoolRepository) DeleteAlertRule(ctx context.Context, ruleID int) error {
-	_, err := r.db.Pool.Exec(ctx, `DELETE FROM pool_alert_rules WHERE id=$1`, ruleID)
+// DeleteAlertRule deletes an alert rule, scoped by pool_id AND rule id so a
+// rule can only be removed through its owning pool's URL.
+func (r *PoolRepository) DeleteAlertRule(ctx context.Context, poolID, ruleID int) error {
+	_, err := r.db.Pool.Exec(ctx, `DELETE FROM pool_alert_rules WHERE id=$1 AND pool_id=$2`, ruleID, poolID)
 	return err
 }
 
@@ -878,6 +935,54 @@ func (r *PoolRepository) UpdateAlertRuleFiredAt(ctx context.Context, ruleID int)
 	_, err := r.db.Pool.Exec(ctx,
 		`UPDATE pool_alert_rules SET last_fired_at=NOW() WHERE id=$1`, ruleID)
 	return err
+}
+
+// --- Filter builder lookups ---
+
+// GetDistinctISPs returns up to 50 distinct, non-empty ISP names from the
+// proxies table, filtered by an optional case-insensitive search term (empty
+// term matches all). Used to populate the pool filter-builder UI.
+func (r *PoolRepository) GetDistinctISPs(ctx context.Context, search string) ([]string, error) {
+	rows, err := r.db.Pool.Query(ctx,
+		`SELECT DISTINCT isp FROM proxies WHERE isp IS NOT NULL AND isp ILIKE $1 ORDER BY isp LIMIT 50`,
+		"%"+search+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	isps := []string{}
+	for rows.Next() {
+		var isp string
+		if err := rows.Scan(&isp); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(isp) != "" {
+			isps = append(isps, isp)
+		}
+	}
+	return isps, rows.Err()
+}
+
+// GetDistinctTags returns up to 100 distinct, non-empty proxy tags for the
+// pool filter-builder UI.
+func (r *PoolRepository) GetDistinctTags(ctx context.Context) ([]string, error) {
+	rows, err := r.db.Pool.Query(ctx,
+		`SELECT DISTINCT unnest(tags) AS tag FROM proxies WHERE array_length(tags,1) > 0 ORDER BY tag LIMIT 100`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tags := []string{}
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(tag) != "" {
+			tags = append(tags, tag)
+		}
+	}
+	return tags, rows.Err()
 }
 
 // --- Export ---

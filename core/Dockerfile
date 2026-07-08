@@ -16,8 +16,11 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+# Build the application.
+# TARGETARCH is provided automatically by Docker Buildx so multi-platform builds
+# (linux/amd64, linux/arm64) produce a binary matching the target image arch.
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags='-w -s -extldflags "-static"' \
     -a -installsuffix cgo \
     -o /app/bin/server \

@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { useRouter } from "next/navigation"
+import { api } from "@/lib/api"
 import {
   CommandDialog,
   CommandEmpty,
@@ -79,7 +80,10 @@ export function CommandPalette() {
         </CommandGroup>
         <CommandGroup heading="Actions">
           <CommandItem
-            onSelect={() => runCommand(() => router.push("/login"))}
+            onSelect={() => runCommand(() => {
+              api.clearToken()
+              router.push("/login")
+            })}
           >
             <LogOut className="mr-2 h-4 w-4" />
             <span>Logout</span>
