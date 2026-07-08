@@ -3,6 +3,7 @@ package api
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,16 +26,21 @@ import (
 // They are intentionally NOT persisted — a restart clears them, which is fine
 // since the goal is to blunt online attacks, not forensic accounting.
 type authRateLimiter struct {
-	mu sync.Mutex
-	log logger.Logger
+	mu  sync.Mutex
+	log *logger.Logger
+
+	// trustProxyHeaders: honour X-Forwarded-For / X-Real-IP only when true, i.e.
+	// when behind a trusted reverse proxy. When false (direct exposure) these are
+	// ignored so they can't be spoofed to bypass per-IP throttling (AUD-20).
+	trustProxyHeaders bool
 
 	// per-IP state
 	ipAttempts map[string][]time.Time // timestamps of failed attempts per IP
 	ipBlocked  map[string]time.Time   // unblock time per IP
 
 	// global state
-	globalAttempts []time.Time // timestamps of ALL attempts (last 60 s)
-	globalLockUntil time.Time  // when the global lockout expires
+	globalAttempts  []time.Time // timestamps of ALL attempts (last 60 s)
+	globalLockUntil time.Time   // when the global lockout expires
 
 	// config (immutable after construction)
 	ipMaxAttempts   int
@@ -47,17 +53,19 @@ type authRateLimiter struct {
 func newAuthRateLimiter(
 	ipMaxAttempts, ipWindowMin, ipBlockMin int,
 	globalMax, globalLockoutMin int,
+	trustProxyHeaders bool,
 	log *logger.Logger,
 ) *authRateLimiter {
 	rl := &authRateLimiter{
-		log:             *log,
-		ipAttempts:      make(map[string][]time.Time),
-		ipBlocked:       make(map[string]time.Time),
-		ipMaxAttempts:   ipMaxAttempts,
-		ipWindow:        time.Duration(ipWindowMin) * time.Minute,
-		ipBlockDuration: time.Duration(ipBlockMin) * time.Minute,
-		globalMax:       globalMax,
-		globalLockout:   time.Duration(globalLockoutMin) * time.Minute,
+		log:               log,
+		trustProxyHeaders: trustProxyHeaders,
+		ipAttempts:        make(map[string][]time.Time),
+		ipBlocked:         make(map[string]time.Time),
+		ipMaxAttempts:     ipMaxAttempts,
+		ipWindow:          time.Duration(ipWindowMin) * time.Minute,
+		ipBlockDuration:   time.Duration(ipBlockMin) * time.Minute,
+		globalMax:         globalMax,
+		globalLockout:     time.Duration(globalLockoutMin) * time.Minute,
 	}
 	// Background cleanup every 5 minutes
 	go rl.cleanup()
@@ -72,7 +80,7 @@ func newAuthRateLimiter(
 func (rl *authRateLimiter) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := realIP(r)
+			ip := rl.clientIP(r)
 			now := time.Now()
 
 			rl.mu.Lock()
@@ -197,26 +205,26 @@ func filterAfter(ts []time.Time, cutoff time.Time) []time.Time {
 	return ts[:i]
 }
 
-// realIP extracts the client IP, respecting X-Forwarded-For / X-Real-IP set by
-// a trusted reverse proxy (Nginx).
-func realIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For may be "client, proxy1, proxy2" — take the first.
-		if idx := len(xff); idx > 0 {
-			for i := 0; i < len(xff); i++ {
-				if xff[i] == ',' {
-					xff = xff[:i]
-					break
-				}
+// clientIP extracts the client IP for rate-limiting. X-Forwarded-For / X-Real-IP
+// are honoured ONLY when trustProxyHeaders is set (i.e. behind a trusted reverse
+// proxy); otherwise they are ignored so a directly-exposed API can't be tricked
+// into treating every spoofed header value as a fresh IP and bypassing the
+// per-IP login block (AUD-20).
+func (rl *authRateLimiter) clientIP(r *http.Request) string {
+	if rl.trustProxyHeaders {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// X-Forwarded-For may be "client, proxy1, proxy2" — take the first.
+			if idx := strings.IndexByte(xff, ','); idx >= 0 {
+				xff = xff[:idx]
+			}
+			if ip := net.ParseIP(strings.TrimSpace(xff)); ip != nil {
+				return ip.String()
 			}
 		}
-		if ip := net.ParseIP(xff); ip != nil {
-			return ip.String()
-		}
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		if ip := net.ParseIP(xri); ip != nil {
-			return ip.String()
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

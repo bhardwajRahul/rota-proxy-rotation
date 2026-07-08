@@ -519,18 +519,23 @@ func (db *DB) Migrate(ctx context.Context) error {
 		return migrations[i].Version < migrations[j].Version
 	})
 
-	// Get current version
-	currentVersion, err := db.getCurrentVersion(ctx)
+	// Load the set of already-applied versions. We track each version
+	// individually instead of using MAX(version) as a watermark: the migration
+	// slice is intentionally NOT strictly ascending (e.g. 15 after 16, 10 after
+	// 20), so a lower-numbered migration added in a later release must still run
+	// rather than being silently skipped because it sits below the highest
+	// applied version.
+	applied, err := db.getAppliedVersions(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get current version: %w", err)
+		return fmt.Errorf("failed to get applied migrations: %w", err)
 	}
 
-	db.logger.Info("current database version", "version", currentVersion)
+	db.logger.Info("current database version", "version", maxAppliedVersion(applied))
 
 	// Apply pending migrations
 	appliedCount := 0
 	for _, migration := range migrations {
-		if migration.Version <= currentVersion {
+		if applied[migration.Version] {
 			continue
 		}
 
@@ -582,6 +587,56 @@ func (db *DB) getCurrentVersion(ctx context.Context) (int, error) {
 	}
 
 	return version, nil
+}
+
+// getAppliedVersions returns the set of migration versions already recorded in
+// schema_migrations. Reading every recorded version (rather than just the
+// MAX) lets Migrate detect and run out-of-order or later-added migrations
+// whose version number is below the current watermark.
+func (db *DB) getAppliedVersions(ctx context.Context) (map[int]bool, error) {
+	applied := make(map[int]bool)
+
+	// Check if migrations table exists
+	var exists bool
+	query := `
+		SELECT EXISTS (
+			SELECT FROM information_schema.tables
+			WHERE table_schema = 'public'
+			AND table_name = 'schema_migrations'
+		);
+	`
+	if err := db.Pool.QueryRow(ctx, query).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		// Fresh DB — nothing applied yet.
+		return applied, nil
+	}
+
+	rows, err := db.Pool.Query(ctx, `SELECT version FROM schema_migrations;`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		applied[v] = true
+	}
+	return applied, rows.Err()
+}
+
+// maxAppliedVersion returns the highest version in the applied set (0 if empty).
+func maxAppliedVersion(applied map[int]bool) int {
+	max := 0
+	for v := range applied {
+		if v > max {
+			max = v
+		}
+	}
+	return max
 }
 
 // applyMigration applies a single migration
@@ -656,18 +711,17 @@ func (db *DB) Rollback(ctx context.Context) error {
 
 // GetMigrationStatus returns the status of all migrations
 func (db *DB) GetMigrationStatus(ctx context.Context) ([]map[string]interface{}, error) {
-	currentVersion, err := db.getCurrentVersion(ctx)
+	applied, err := db.getAppliedVersions(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get current version: %w", err)
+		return nil, fmt.Errorf("failed to get applied migrations: %w", err)
 	}
 
 	var status []map[string]interface{}
 	for _, migration := range migrations {
-		applied := migration.Version <= currentVersion
 		status = append(status, map[string]interface{}{
 			"version":     migration.Version,
 			"description": migration.Description,
-			"applied":     applied,
+			"applied":     applied[migration.Version],
 		})
 	}
 

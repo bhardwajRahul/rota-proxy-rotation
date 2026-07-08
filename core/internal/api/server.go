@@ -19,6 +19,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
+	"github.com/alpkeskin/rota/core/docs"
+
 	// Import for swagger documentation
 	_ "github.com/alpkeskin/rota/core/internal/models"
 )
@@ -30,16 +32,22 @@ type ProxyServer interface {
 
 // Server represents the API server
 type Server struct {
-	router    *chi.Mux
-	server    *http.Server
-	logger    *logger.Logger
-	db        *database.DB
-	port      int
-	jwtSecret string
-	authRL    *authRateLimiter
+	router            *chi.Mux
+	server            *http.Server
+	logger            *logger.Logger
+	db                *database.DB
+	port              int
+	jwtSecret         string
+	authRL            *authRateLimiter
+	corsOrigins       []string
+	trustProxyHeaders bool
 
 	// Proxy server reference for reloading
 	proxyServer ProxyServer
+
+	// cancelServices stops all background services (source/pool/alert/cleanup)
+	// on shutdown, before the DB connection is closed (see AUD-6).
+	cancelServices context.CancelFunc
 
 	// Handlers
 	authHandler          *handlers.AuthHandler
@@ -68,9 +76,17 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	userRepo := repository.NewUserRepository(db)
 	adminRepo := repository.NewAdminRepository(db)
 
-	// Seed admin credentials from env on first start (no-op if already seeded)
-	if err := adminRepo.Seed(context.Background(), cfg.AdminUser, cfg.AdminPass); err != nil {
+	// Seed admin credentials from env on first start (no-op if already seeded).
+	// If the password was auto-generated (ROTA_ADMIN_PASSWORD unset), surface it
+	// loudly in the logs — it's the only time it's ever shown.
+	if seeded, err := adminRepo.Seed(context.Background(), cfg.AdminUser, cfg.AdminPass); err != nil {
 		log.Warn("failed to seed admin credentials", "error", err)
+	} else if seeded && cfg.AdminPassGenerated {
+		log.Warn("======================================================")
+		log.Warn("Generated admin password — save it now, shown only once",
+			"username", cfg.AdminUser, "password", cfg.AdminPass)
+		log.Warn("Change it anytime via Settings → Admin Account")
+		log.Warn("======================================================")
 	}
 
 	// Generate random JWT secret on startup
@@ -99,9 +115,12 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	healthHandler := handlers.NewHealthHandler(db, proxyRepo, log)
 	dashboardHandler := handlers.NewDashboardHandler(dashboardRepo, proxyRepo, log)
 	proxyHandler := handlers.NewProxyHandler(proxyRepo, healthChecker, log)
+	// Drop cached upstream transports when a proxy is changed/removed so stale
+	// credentials aren't reused by the proxy engine (AUD-16).
+	proxyHandler.SetCacheInvalidator(proxy.ClearTransportCache)
 	logsHandler := handlers.NewLogsHandler(logRepo, log)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo, log, nil) // onUpdate set below
-	websocketHandler := handlers.NewWebSocketHandler(dashboardRepo, proxyRepo, logRepo, log)
+	websocketHandler := handlers.NewWebSocketHandler(dashboardRepo, proxyRepo, logRepo, log, cfg.CORSAllowedOrigins)
 	metricsHandler := handlers.NewMetricsHandler(log)
 	documentationHandler := handlers.NewDocumentationHandler()
 	sourceHandler := handlers.NewSourceHandler(sourceRepo, sourceSvc, log)
@@ -115,6 +134,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 		cfg.AuthIPBlockMinutes,
 		cfg.AuthGlobalMaxPerMinute,
 		cfg.AuthGlobalLockoutMin,
+		cfg.TrustProxyHeaders,
 		log,
 	)
 
@@ -125,6 +145,8 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 		port:                 cfg.APIPort,
 		jwtSecret:            jwtSecret,
 		authRL:               authRL,
+		corsOrigins:          cfg.CORSAllowedOrigins,
+		trustProxyHeaders:    cfg.TrustProxyHeaders,
 		authHandler:          authHandler,
 		healthHandler:        healthHandler,
 		dashboardHandler:     dashboardHandler,
@@ -154,17 +176,21 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	alertWatcher := services.NewAlertWatcher(poolRepo, log)
 	cleanupSvc := services.NewProxyCleanupService(proxyRepo, settingsRepo, log)
 
-	// Start background services
-	sourceSvc.Start(context.Background())
-	poolSvc.Start(context.Background())
-	alertWatcher.Start(context.Background())
+	// Start background services under a cancellable context so they can be
+	// stopped on shutdown before the DB is closed (AUD-6). Their loops all
+	// select on ctx.Done().
+	svcCtx, cancelServices := context.WithCancel(context.Background())
+	s.cancelServices = cancelServices
+	sourceSvc.Start(svcCtx)
+	poolSvc.Start(svcCtx)
+	alertWatcher.Start(svcCtx)
 
 	// NOTE: global StartPeriodicHealthCheck is intentionally NOT started.
 	// Its 60s timeout was too lenient and kept flapping pool-marked 'failed'
 	// proxies back to 'active', returning dead proxies to rotation.
 	// Pool-level health checks (PoolService cron) are authoritative.
 
-	cleanupSvc.Start(context.Background())
+	cleanupSvc.Start(svcCtx)
 
 	s.setupMiddleware()
 	s.setupRoutes()
@@ -186,8 +212,12 @@ func (s *Server) setupMiddleware() {
 	s.router.Use(OptionsMiddleware())
 
 	// CORS middleware
+	origins := s.corsOrigins
+	if len(origins) == 0 {
+		origins = []string{"*"}
+	}
 	s.router.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"*"},
+		AllowedOrigins:   origins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
@@ -196,7 +226,12 @@ func (s *Server) setupMiddleware() {
 	}))
 
 	s.router.Use(middleware.RequestID)
-	s.router.Use(middleware.RealIP)
+	// Only derive the client IP from X-Forwarded-For / X-Real-IP when explicitly
+	// trusting an upstream reverse proxy; otherwise a directly-exposed API would
+	// let clients spoof their apparent IP (AUD-20).
+	if s.trustProxyHeaders {
+		s.router.Use(middleware.RealIP)
+	}
 	s.router.Use(LoggerMiddleware(s.logger))
 	s.router.Use(middleware.Recoverer)
 	// No global timeout — health-check routes need minutes; individual routes handle their own timeouts
@@ -317,6 +352,11 @@ func (s *Server) Start() error {
 // Shutdown gracefully shuts down the API server
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down API server")
+	// Stop background services first so no goroutine is mid-query when the
+	// DB connection is closed by main() after Shutdown returns (AUD-6).
+	if s.cancelServices != nil {
+		s.cancelServices()
+	}
 	return s.server.Shutdown(ctx)
 }
 
@@ -326,6 +366,7 @@ func (s *Server) SetProxyServer(ps ProxyServer) {
 }
 
 // ReloadProxyPool reloads the proxy pool from database
+//
 //	@Summary		Reload proxy pool
 //	@Description	Reload proxy pool from database
 //	@Tags			proxies
@@ -357,11 +398,16 @@ func (s *Server) ReloadProxyPool(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"success","message":"Proxy pool reloaded successfully"}`))
 }
 
-// serveSwaggerJSON serves the swagger.json file
+// serveSwaggerJSON serves the OpenAPI spec embedded in the binary.
+// Served from memory (not the filesystem) so it works regardless of the
+// process working directory / deployment layout — see docs.SwaggerJSON (#20).
 func (s *Server) serveSwaggerJSON(w http.ResponseWriter, r *http.Request) {
-	// Serve from the docs directory in the project root
-	swaggerPath := "docs/swagger.json"
-	http.ServeFile(w, r, swaggerPath)
+	w.Header().Set("Content-Type", "application/json")
+	if len(docs.SwaggerJSON) == 0 {
+		http.Error(w, "swagger spec unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Write(docs.SwaggerJSON) //nolint:errcheck
 }
 
 // generateJWTSecret generates a cryptographically secure random JWT secret

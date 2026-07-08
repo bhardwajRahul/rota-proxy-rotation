@@ -149,6 +149,11 @@ func (h *AuthHandler) usernameFromRequest(r *http.Request) (string, error) {
 	}
 	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		// Restrict to HMAC signing to prevent alg-confusion attacks
+		// (mirrors JWTMiddleware in api/middleware.go).
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
 		return h.jwtSecret, nil
 	})
 	if err != nil || !token.Valid {

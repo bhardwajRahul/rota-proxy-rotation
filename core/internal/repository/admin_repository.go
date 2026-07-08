@@ -21,26 +21,29 @@ func NewAdminRepository(db *database.DB) *AdminRepository {
 
 // Seed inserts the initial admin account if the table is empty.
 // Called once at startup using env-var credentials as the bootstrap values.
-func (r *AdminRepository) Seed(ctx context.Context, username, password string) error {
+// Returns seeded=true only when it actually inserted the account (first boot),
+// so the caller can surface a generated password exactly once.
+func (r *AdminRepository) Seed(ctx context.Context, username, password string) (seeded bool, err error) {
 	var count int
-	err := r.db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM admin_credentials`).Scan(&count)
-	if err != nil {
-		return fmt.Errorf("seed check: %w", err)
+	if err := r.db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM admin_credentials`).Scan(&count); err != nil {
+		return false, fmt.Errorf("seed check: %w", err)
 	}
 	if count > 0 {
-		return nil // already seeded
+		return false, nil // already seeded
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return fmt.Errorf("hash seed password: %w", err)
+		return false, fmt.Errorf("hash seed password: %w", err)
 	}
 
-	_, err = r.db.Pool.Exec(ctx,
+	if _, err := r.db.Pool.Exec(ctx,
 		`INSERT INTO admin_credentials (username, password_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 		username, string(hash),
-	)
-	return err
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Authenticate checks username+password and returns username on success.
